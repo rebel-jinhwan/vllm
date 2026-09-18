@@ -698,7 +698,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
-        self.cudagraph_manager = ModelCudaGraphManager(
+        self.cudagraph_manager = self.cudagraph_manager_cls(
             self.vllm_config,
             self.device,
             cudagraph_mode,
@@ -1629,6 +1629,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.ec_connector.no_forward(scheduler_output).ec_connector_output,
         )
 
+    def run_model(
+        self,
+        batch_desc: BatchExecutionDescriptor,
+        input_batch: InputBatch,
+        model_inputs: dict[str, Any],
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings_by_layer: dict[str, torch.Tensor] | None,
+        dp_sync: DPSyncState | None,
+        ubatch_state: UBatchState | None,
+        skip_compiled: bool,
+        connector_kwargs: dict[str, Any],
+    ) -> Any:
+        """Run the forward pass for one prepared batch and return the raw model
+        output.
+
+        Out-of-tree hardware runners override this to dispatch to their own
+        compiled or captured graph. Everything before it (request state, input
+        preparation, attention metadata) and after it (sampling, bookkeeping)
+        stays shared."""
+        ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
+        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+            # Use explicit cudagraph replay for FULL mode.
+            # NOTE(woosuk): Here, we don't need to pass the input tensors,
+            # because they are already copied to the CUDA graph input buffers.
+            assert self.cudagraph_manager is not None
+            self.kv_connector.pre_forward(
+                **connector_kwargs, attn_metadata=attn_metadata
+            )
+            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+        else:
+            # For piecewise and eager mode, just call model().
+            batch_descriptor = BatchDescriptor(
+                num_tokens=input_batch.num_tokens_after_padding,
+                has_lora=self.lora_config is not None,
+                num_active_loras=batch_desc.num_active_loras,
+            )
+
+            with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=input_batch.num_tokens_after_padding,
+                cudagraph_runtime_mode=batch_desc.cg_mode,
+                num_tokens_across_dp=(
+                    dp_sync.num_tokens_across_dp if dp_sync is not None else None
+                ),
+                batch_descriptor=batch_descriptor,
+                ubatch_slices=ubatch_slices,
+                slot_mapping=slot_mappings_by_layer,
+                skip_compiled=skip_compiled,
+                is_padding=input_batch.is_padding,
+            ):
+                self.kv_connector.pre_forward(**connector_kwargs)
+                if ubatch_state is not None:
+                    assert self.ubatch_runner is not None
+                    model_output = self.ubatch_runner.run(
+                        self.model, model_inputs, ubatch_state
+                    )
+                elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
+                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
+                    # PIECEWISE after the cudagraph manager exists.
+                    assert self.cudagraph_manager is not None
+                    model_output = self.cudagraph_manager.run_pw_graph(
+                        self.model, model_inputs
+                    )
+                else:
+                    # Eager (NONE): call the raw model directly.
+                    model_output = self.model(**model_inputs)
+
+        return model_output
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1907,56 +1978,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens=input_batch.num_tokens,
         )
 
-        # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Use explicit cudagraph replay for FULL mode.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(
-                **connector_kwargs, attn_metadata=attn_metadata
-            )
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-        else:
-            # For piecewise and eager mode, just call model().
-            batch_descriptor = BatchDescriptor(
-                num_tokens=input_batch.num_tokens_after_padding,
-                has_lora=self.lora_config is not None,
-                num_active_loras=batch_desc.num_active_loras,
-            )
-
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=(
-                    dp_sync.num_tokens_across_dp if dp_sync is not None else None
-                ),
-                batch_descriptor=batch_descriptor,
-                ubatch_slices=ubatch_slices,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-                is_padding=input_batch.is_padding,
-            ):
-                self.kv_connector.pre_forward(**connector_kwargs)
-                if ubatch_state is not None:
-                    assert self.ubatch_runner is not None
-                    model_output = self.ubatch_runner.run(
-                        self.model, model_inputs, ubatch_state
-                    )
-                elif batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
-                    # Run the PIECEWISE graph (compiled PW cudagraph or breakable
-                    # cudagraph, chosen inside run_pw_graph). cg_mode is only
-                    # PIECEWISE after the cudagraph manager exists.
-                    assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
-                else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
-
+        model_output = self.run_model(
+            batch_desc,
+            input_batch,
+            model_inputs,
+            attn_metadata,
+            slot_mappings_by_layer,
+            dp_sync,
+            ubatch_state,
+            skip_compiled,
+            connector_kwargs,
+        )
         self.kv_connector.finish_forward()
 
         if self.is_last_pp_rank:
@@ -2310,6 +2342,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @property
     def pcp_manager_cls(self) -> type[pcp.PCPManager]:
         return pcp.PCPManager
+
+    # Out-of-tree hardware runners can select the class that picks a step's
+    # batch shape and replays or dispatches its graph.
+    @property
+    def cudagraph_manager_cls(self) -> type[ModelCudaGraphManager]:
+        return ModelCudaGraphManager
 
 
 class ExecuteModelState(NamedTuple):
