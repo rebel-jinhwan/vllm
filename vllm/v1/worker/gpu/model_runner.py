@@ -161,7 +161,10 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     get_max_chunk_logits,
 )
-from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.speculator import (
+    BaseSpeculator,
+    DraftModelSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -172,6 +175,7 @@ from vllm.v1.worker.gpu.ubatch_utils import (
 )
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
+    AttentionGroup,
     KVBlockZeroer,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
@@ -272,7 +276,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
-                self.speculator = init_speculator(self.vllm_config, self.device)
+                self.speculator = self.init_speculator()
 
             if self.speculative_config.method in (
                 "eagle3",
@@ -698,7 +702,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             is_profiling=is_profiling,
             piecewise_capture_available=piecewise_capture_available,
         )
-        self.cudagraph_manager = self.cudagraph_manager_cls(
+        self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
@@ -1629,6 +1633,73 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.ec_connector.no_forward(scheduler_output).ec_connector_output,
         )
 
+    def init_speculator(self) -> BaseSpeculator:
+        """The drafter for the configured speculative method.
+
+        Out-of-tree hardware runners override this to run the draft on their
+        own graphs; upstream's `AutoRegressiveSpeculator` drives it eagerly."""
+        return init_speculator(self.vllm_config, self.device)
+
+    def dispatch_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        max_query_len: int,
+        *,
+        dummy_run: bool,
+        need_eager: bool,
+        num_active_loras: int,
+        allow_ubatching: bool,
+    ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+        """Decide the shape this step runs at, agreed across DP ranks: the
+        padded request and token counts, the graph mode and micro-batching.
+
+        Out-of-tree hardware runners override this to pick from the shapes
+        they compiled and to run their own DP agreement. `scheduler_output`
+        is passed for what the counts do not carry, such as the step's
+        phase. A descriptor with `num_tokens == 0` skips the forward."""
+        return dispatch_cg_and_sync_dp(
+            self.cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            self.dp_size,
+            self.dp_rank,
+            max_query_len=max_query_len,
+            need_eager=need_eager,
+            num_active_loras=num_active_loras,
+            parallel_config=self.parallel_config,
+            allow_ubatching=allow_ubatching,
+            uniform_decode=uniform_token_count == self.decode_query_len,
+        )
+
+    def build_attn_metadata(
+        self,
+        input_batch: InputBatch,
+        batch_desc: BatchExecutionDescriptor,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        *,
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
+        """Per-layer attention metadata for this step.
+
+        Out-of-tree hardware runners override this when their attention
+        backend's builder takes inputs the in-tree builders do not, such as
+        host-side positions or a padded batch dimension."""
+        return self.model_state.prepare_attn(
+            input_batch,
+            batch_desc.cg_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            self.kv_cache_config,
+            for_capture=for_capture,
+        )
+
     def run_model(
         self,
         batch_desc: BatchExecutionDescriptor,
@@ -1760,21 +1831,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
-        batch_desc, dp_sync = dispatch_cg_and_sync_dp(
-            self.cudagraph_manager,
+        batch_desc, dp_sync = self.dispatch_batch(
+            scheduler_output,
             num_reqs,
             num_toks,
             uniform_tok_count,
-            self.dp_size,
-            self.dp_rank,
-            max_query_len=max_query_len,
+            max_query_len,
+            dummy_run=dummy_run,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
-            parallel_config=self.parallel_config,
             allow_ubatching=(
                 self.ubatch_runner is not None and not skip_attn_for_dummy_run
             ),
-            uniform_decode=uniform_tok_count == self.decode_query_len,
         )
 
         if batch_desc.num_tokens == 0:
@@ -1889,13 +1957,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
                     for groups in attn_groups
                 ]
-            attn_metadata = self.model_state.prepare_attn(
+            attn_metadata = self.build_attn_metadata(
                 input_batch,
-                batch_desc.cg_mode,
+                batch_desc,
                 block_tables,
                 slot_mappings,
                 attn_groups,
-                self.kv_cache_config,
                 # FULL replay reads capture-time metadata buffers. Re-stage them
                 # from the zeroed dummy block tables instead of retaining state
                 # indices from the previous real batch.
@@ -2342,12 +2409,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @property
     def pcp_manager_cls(self) -> type[pcp.PCPManager]:
         return pcp.PCPManager
-
-    # Out-of-tree hardware runners can select the class that picks a step's
-    # batch shape and replays or dispatches its graph.
-    @property
-    def cudagraph_manager_cls(self) -> type[ModelCudaGraphManager]:
-        return ModelCudaGraphManager
 
 
 class ExecuteModelState(NamedTuple):
