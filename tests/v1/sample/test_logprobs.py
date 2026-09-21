@@ -1311,7 +1311,7 @@ def test_token_logprobs_large_batch_int64_row_offset():
     """
     if not current_platform.is_cuda():
         pytest.skip("int32 row-offset overflow is a CUDA kernel issue")
-    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+    from vllm.v1.worker.gpu.kernels import compute_token_logprobs
 
     device = torch.device("cuda")
     vocab_size = 131072

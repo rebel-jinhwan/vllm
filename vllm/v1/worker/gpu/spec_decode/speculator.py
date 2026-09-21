@@ -31,10 +31,10 @@ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
     OnlineAcceptanceEstimator,
 )
+from vllm.v1.worker.kernels import ModelRunnerKernels
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
@@ -99,9 +99,15 @@ class BaseSpeculator(ABC):
 
 
 class DraftModelSpeculator(BaseSpeculator):
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        kernels: ModelRunnerKernels,
+    ):
         self.vllm_config = vllm_config
         self.device = device
+        self.kernels = kernels
 
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
@@ -408,7 +414,7 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
-            sampled = gumbel_sample(
+            sampled = self.kernels.gumbel_sample(
                 logits,
                 idx_mapping,
                 temperature,

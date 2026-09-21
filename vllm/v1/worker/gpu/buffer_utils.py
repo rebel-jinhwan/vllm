@@ -212,6 +212,26 @@ class StagedWriteTensor:
                 self._staged_write_contents
             )
 
+        if not HAS_TRITON:
+            # The kernel is a scatter of per-row segments; do it with indexing.
+            indices = indices_uva.to(self.gpu.device).long()
+            cu_lens = torch.cat([cu_lens_uva.new_zeros(1), cu_lens_uva]).long()
+            lens = cu_lens[1:] - cu_lens[:-1]
+            write = torch.repeat_interleave(
+                torch.arange(n, device=self.gpu.device), lens.to(self.gpu.device)
+            )
+            offset = (
+                torch.arange(int(cu_lens[-1]), device=self.gpu.device)
+                - (cu_lens[:-1].to(self.gpu.device)[write])
+            )
+            flat = (
+                indices[write] * self.gpu.stride(0)
+                + starts_uva.to(self.gpu.device).long()[write]
+                + offset
+            )
+            self.gpu.view(-1)[flat] = write_contents.to(self.gpu.dtype)
+            self.clear_staged_writes()
+            return
         # Write diffs to the GPU buffer
         _apply_write_kernel[(n,)](
             self.gpu,

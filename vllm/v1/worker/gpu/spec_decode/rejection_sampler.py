@@ -8,22 +8,14 @@ import torch
 
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
-from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
-from vllm.v1.worker.gpu.input_batch import (
-    InputBatch,
-    get_num_sampled_and_rejected,
-)
-from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
-from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-    rejection_sample,
-)
 
 # Cap on the FP32 target-logits buffer materialized by apply_sampling_params.
 # TODO(mgoin): Chunking is a workaround. The rejection kernels already upcast
@@ -52,26 +44,6 @@ def _iter_request_chunks(
         end = min(num_reqs, max(start + 1, end))
         yield start, end
         start = end
-
-
-@triton.jit
-def _flatten_sampled_kernel(
-    # [num_logits]
-    flat_sampled_ptr,
-    # [num_reqs, num_speculative_steps + 1]
-    sampled_ptr,
-    sampled_stride,
-    # [num_reqs]
-    num_sampled_ptr,
-    # [num_reqs + 1]
-    cu_num_logits_ptr,
-):
-    req_idx = tl.program_id(0)
-    start_idx = tl.load(cu_num_logits_ptr + req_idx)
-    num_sampled = tl.load(num_sampled_ptr + req_idx)
-    for i in range(num_sampled):
-        token_id = tl.load(sampled_ptr + req_idx * sampled_stride + i)
-        tl.store(flat_sampled_ptr + start_idx + i, token_id)
 
 
 class RejectionSampler:
@@ -121,13 +93,8 @@ class RejectionSampler:
         flat_sampled = torch.zeros(
             num_logits, dtype=sampled.dtype, device=sampled.device
         )
-        _flatten_sampled_kernel[(num_reqs,)](
-            flat_sampled,
-            sampled,
-            sampled.stride(0),
-            num_sampled,
-            cu_num_logits,
-            num_warps=1,
+        self.sampler.kernels.flatten_sampled(
+            flat_sampled, sampled, num_sampled, cu_num_logits
         )
         expanded_logits = num_logits != num_reqs
         cu_num_generated_tokens: list[int] | torch.Tensor | None = None
@@ -140,6 +107,7 @@ class RejectionSampler:
             else:
                 cu_num_generated_tokens = cu_num_logits_np.tolist()
         return compute_topk_scores(
+            self.sampler.kernels,
             logits,
             max_num_logprobs,
             flat_sampled,
@@ -188,7 +156,7 @@ class RejectionSampler:
             expanded_local_pos,
             seq_lens_upper_bound_np,
         )
-        sampled, num_sampled = rejection_sample(
+        sampled, num_sampled = self.sampler.kernels.rejection_sample(
             processed_logits,
             draft_logits,
             draft_sampled,
@@ -295,7 +263,11 @@ class RejectionSampler:
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
-        num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+        num_nans = (
+            self.sampler.kernels.get_num_nans(logits)
+            if self.sampler.compute_nans
+            else None
+        )
 
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
         pos = input_batch.positions[input_batch.logits_indices]
@@ -314,7 +286,7 @@ class RejectionSampler:
             max_num_logprobs,
         )
 
-        num_sampled, num_rejected = get_num_sampled_and_rejected(
+        num_sampled, num_rejected = self.sampler.kernels.get_num_sampled_and_rejected(
             num_sampled,
             input_batch.seq_lens,
             input_batch.cu_num_logits,
