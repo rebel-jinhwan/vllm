@@ -15,8 +15,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         sampler_output: SamplerOutput,
         num_sampled_tokens: torch.Tensor,
-        main_stream: torch.cuda.Stream,
-        copy_stream: torch.cuda.Stream,
+        main_stream: torch.Stream,
+        copy_stream: torch.Stream,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -24,8 +24,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.model_runner_output = model_runner_output
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        # Blocking (sleep) event to avoid busy-polling the driver lock.
+        self.copy_event = torch.Event(device=copy_stream.device, blocking=True)
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -76,14 +76,14 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         pooler_output: torch.Tensor,
         is_valid: torch.Tensor | None,
-        main_stream: torch.cuda.Stream,
-        copy_stream: torch.cuda.Stream,
+        main_stream: torch.Stream,
+        copy_stream: torch.Stream,
     ):
         self.model_runner_output = model_runner_output
         self.pooler_output = pooler_output
         self.is_valid = is_valid
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
+        # Blocking (sleep) event to avoid busy-polling the driver lock.
+        self.copy_event = torch.Event(device=copy_stream.device, blocking=True)
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -111,12 +111,12 @@ def async_copy_to_np(x: torch.Tensor) -> np.ndarray:
 
 
 @contextlib.contextmanager
-def stream(to_stream: torch.cuda.Stream, from_stream: torch.cuda.Stream):
-    """Lightweight version of torch.cuda.stream() context manager which
-    avoids current_stream and device lookups.
+def stream(to_stream: torch.Stream, from_stream: torch.Stream):
+    """Lightweight version of the torch.cuda.stream() context manager which
+    avoids current_stream and device lookups, on any accelerator.
     """
     try:
-        torch.cuda.set_stream(to_stream)
+        torch.accelerator.set_stream(to_stream)
         yield
     finally:
-        torch.cuda.set_stream(from_stream)
+        torch.accelerator.set_stream(from_stream)

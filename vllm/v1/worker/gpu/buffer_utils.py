@@ -6,8 +6,9 @@ from functools import partial
 import numpy as np
 import torch
 
-from vllm.triton_utils import tl, triton
-from vllm.utils.platform_utils import is_uva_available
+from vllm.platforms import current_platform
+from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.utils.platform_utils import is_pin_memory_available, is_uva_available
 from vllm.utils.torch_utils import (
     async_tensor_h2d,
     get_accelerator_view_from_cpu_tensor,
@@ -42,12 +43,20 @@ def async_copy_to_gpu(
 
 
 class UvaBuffer:
+    """A host buffer the device reads: through a UVA view of the same memory
+    where the platform has UVA, otherwise through a device mirror that
+    `UvaBufferPool.copy_to_uva` refreshes on every write."""
+
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
-        if not is_uva_available():
-            raise RuntimeError("UVA is not available")
-        self.cpu = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=True)
+        self.is_mirror = not is_uva_available()
+        self.cpu = torch.zeros(
+            size, dtype=dtype, device="cpu", pin_memory=is_pin_memory_available()
+        )
         self.np = self.cpu.numpy()
-        self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
+        if self.is_mirror:
+            self.uva = torch.zeros(size, dtype=dtype, device=current_platform.device_type)
+        else:
+            self.uva = get_accelerator_view_from_cpu_tensor(self.cpu)
 
 
 class UvaBufferPool:
@@ -76,6 +85,8 @@ class UvaBufferPool:
         dst = buf.cpu if isinstance(x, torch.Tensor) else buf.np
         n = len(x)
         dst[:n] = x
+        if buf.is_mirror:
+            buf.uva[:n].copy_(buf.cpu[:n])
         return buf.uva[:n]
 
     def copy_to_gpu(
@@ -229,6 +240,12 @@ class FusedStagedWriter:
         output_strides: torch.Tensor,
     ) -> None:
         """Apply and clear the staged writes of `tensors` with one kernel."""
+        if not HAS_TRITON:
+            # The fused kernel reaches each output through a raw pointer table,
+            # which only a Triton kernel can dereference.
+            for t in tensors:
+                t.apply_write()
+            return
         group_ids: list[int] = []
         indices: list[int] = []
         starts: list[int] = []
