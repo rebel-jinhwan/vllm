@@ -9,25 +9,27 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     get_uniform_token_count,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
 logger = init_logger(__name__)
 
 
 class AutoRegressiveSpeculator(DraftModelSpeculator):
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
+    def __init__(
+        self, vllm_config: VllmConfig, device: torch.device, kernels: ModelRunnerKernels
+    ):
+        super().__init__(vllm_config, device, kernels)
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -125,79 +127,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             progress_bar_desc="Capturing decode CUDA graphs",
         )
 
-    # --- Kernels over the draft's input buffers. A platform without Triton
-    # subclasses the speculator and implements these. ---
-
-    def prepare_prefill_inputs(
-        self,
-        last_token_indices: torch.Tensor,
-        current_draft_step: torch.Tensor,
-        input_buffers: InputBuffers,
-        input_batch: InputBatch,
-        num_sampled: torch.Tensor,
-        num_rejected: torch.Tensor,
-        last_sampled: torch.Tensor,
-        next_prefill_tokens: torch.Tensor,
-        max_num_reqs: int,
-    ) -> torch.Tensor:
-        return prepare_prefill_inputs(
-            last_token_indices,
-            current_draft_step,
-            input_buffers,
-            input_batch,
-            num_sampled,
-            num_rejected,
-            last_sampled,
-            next_prefill_tokens,
-            max_num_reqs,
-        )
-
-    def prepare_decode_inputs(
-        self,
-        draft_tokens: torch.Tensor,
-        target_seq_lens: torch.Tensor,
-        num_rejected: torch.Tensor,
-        input_buffers: InputBuffers,
-        max_model_len: int,
-        max_num_reqs: int,
-        advance_draft_positions: bool = True,
-    ) -> None:
-        prepare_decode_inputs(
-            draft_tokens,
-            target_seq_lens,
-            num_rejected,
-            input_buffers,
-            max_model_len,
-            max_num_reqs,
-            advance_draft_positions=advance_draft_positions,
-        )
-
-    def update_draft_inputs(
-        self,
-        draft_tokens: torch.Tensor,
-        current_draft_step: torch.Tensor,
-        hidden_states: torch.Tensor,
-        output_draft_tokens: torch.Tensor,
-        next_input_hidden_states: torch.Tensor,
-        input_buffers: InputBuffers,
-        num_reqs: int,
-        max_model_len: int,
-        num_speculative_steps: int,
-        advance_draft_positions: bool = True,
-    ) -> None:
-        update_draft_inputs(
-            draft_tokens,
-            current_draft_step,
-            hidden_states,
-            output_draft_tokens,
-            next_input_hidden_states,
-            input_buffers,
-            num_reqs,
-            max_model_len,
-            num_speculative_steps,
-            advance_draft_positions=advance_draft_positions,
-        )
-
     def dispatch_batch(
         self,
         num_reqs: int,
@@ -282,7 +211,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Get the input ids and last token indices for the speculator.
-        self.prepare_prefill_inputs(
+        self.kernels.prepare_draft_prefill_inputs(
             self.last_token_indices,
             self.current_draft_step,
             self.input_buffers,
@@ -336,7 +265,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             return self.draft_tokens[:num_reqs, :1]
 
         # Prepare the inputs for the decode steps.
-        self.prepare_decode_inputs(
+        self.kernels.prepare_draft_decode_inputs(
             self.draft_tokens[:num_reqs, 0],
             input_batch.seq_lens,
             num_rejected,
@@ -544,7 +473,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Update the inputs for the next step.
-        self.update_draft_inputs(
+        self.kernels.update_draft_inputs(
             draft_tokens,
             self.current_draft_step,
             hidden_states,
@@ -556,302 +485,3 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.num_speculative_steps,
             advance_draft_positions=self.advance_draft_positions,
         )
-
-
-@triton.jit
-def _prepare_prefill_inputs_kernel(
-    last_token_indices_ptr,
-    draft_current_step_ptr,
-    draft_input_ids_ptr,
-    draft_positions_ptr,
-    draft_query_start_loc_ptr,
-    draft_seq_lens_ptr,
-    target_input_ids_ptr,
-    target_positions_ptr,
-    idx_mapping_ptr,
-    last_sampled_ptr,
-    next_prefill_tokens_ptr,
-    num_sampled_ptr,
-    num_rejected_ptr,
-    query_start_loc_ptr,
-    seq_lens_ptr,
-    max_num_reqs,
-    BLOCK_SIZE: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    num_reqs = tl.num_programs(0)
-    req_state_idx = tl.load(idx_mapping_ptr + req_idx)
-
-    query_start = tl.load(query_start_loc_ptr + req_idx)
-    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
-    query_len = query_end - query_start
-    seq_len = tl.load(seq_lens_ptr + req_idx)
-
-    # Get the true query length and next token after accounting for rejected tokens.
-    num_rejected = tl.load(num_rejected_ptr + req_idx)
-    query_len -= num_rejected
-
-    num_sampled = tl.load(num_sampled_ptr + req_idx)
-    if num_sampled > 0:
-        next_token = tl.load(last_sampled_ptr + req_state_idx).to(tl.int32)
-    else:
-        # Chunked prefilling.
-        # Get the next prefill token.
-        next_token = tl.load(next_prefill_tokens_ptr + req_state_idx)
-
-    # Shift target_input_ids by one.
-    for i in range(1, query_len, BLOCK_SIZE):
-        block = i + tl.arange(0, BLOCK_SIZE)
-        mask = block < query_len
-        input_ids = tl.load(target_input_ids_ptr + query_start + block, mask=mask)
-        tl.store(draft_input_ids_ptr + query_start + block - 1, input_ids, mask=mask)
-
-    last_token_index = query_start + query_len - 1
-    tl.store(last_token_indices_ptr + req_idx, last_token_index)
-    tl.store(draft_input_ids_ptr + last_token_index, next_token)
-
-    # Copy positions.
-    for i in range(0, query_len, BLOCK_SIZE):
-        block = i + tl.arange(0, BLOCK_SIZE)
-        mask = block < query_len
-        target_pos = tl.load(target_positions_ptr + query_start + block, mask=mask)
-        tl.store(draft_positions_ptr + query_start + block, target_pos, mask=mask)
-
-    # Copy query start locations.
-    tl.store(draft_query_start_loc_ptr + req_idx, query_start)
-    # Copy sequence lengths.
-    tl.store(draft_seq_lens_ptr + req_idx, seq_len)
-    if req_idx == (num_reqs - 1):
-        # Reset the current draft step to 0.
-        tl.store(draft_current_step_ptr, 0)
-        # Pad query_start_loc for CUDA graphs.
-        for i in range(num_reqs, max_num_reqs + 1, BLOCK_SIZE):
-            block = i + tl.arange(0, BLOCK_SIZE)
-            mask = block < max_num_reqs + 1
-            tl.store(draft_query_start_loc_ptr + block, query_end, mask=mask)
-        # Pad seq_lens for CUDA graphs.
-        for i in range(num_reqs, max_num_reqs, BLOCK_SIZE):
-            block = i + tl.arange(0, BLOCK_SIZE)
-            mask = block < max_num_reqs
-            tl.store(draft_seq_lens_ptr + block, 0, mask=mask)
-        # Pad last_token_indices for CUDA graphs.
-        for i in range(num_reqs, max_num_reqs, BLOCK_SIZE):
-            block = i + tl.arange(0, BLOCK_SIZE)
-            mask = block < max_num_reqs
-            tl.store(last_token_indices_ptr + block, 0, mask=mask)
-
-
-def prepare_prefill_inputs(
-    # [num_reqs]
-    last_token_indices: torch.Tensor,
-    current_draft_step: torch.Tensor,
-    input_buffers: InputBuffers,
-    input_batch: InputBatch,
-    # [num_reqs]
-    num_sampled: torch.Tensor,
-    # [num_reqs]
-    num_rejected: torch.Tensor,
-    # [max_num_reqs]
-    last_sampled: torch.Tensor,
-    # [max_num_reqs]
-    next_prefill_tokens: torch.Tensor,
-    max_num_reqs,
-) -> torch.Tensor:
-    num_reqs = input_batch.num_reqs
-    _prepare_prefill_inputs_kernel[(num_reqs,)](
-        last_token_indices,
-        current_draft_step,
-        input_buffers.input_ids,
-        input_buffers.positions,
-        input_buffers.query_start_loc,
-        input_buffers.seq_lens,
-        input_batch.input_ids,
-        input_batch.positions,
-        input_batch.idx_mapping,
-        last_sampled,
-        next_prefill_tokens,
-        num_sampled,
-        num_rejected,
-        input_batch.query_start_loc,
-        input_batch.seq_lens,
-        max_num_reqs,
-        BLOCK_SIZE=1024,
-    )
-    return last_token_indices
-
-
-@triton.jit
-def _prepare_decode_inputs_kernel(
-    draft_tokens_ptr,
-    draft_tokens_stride,
-    target_seq_lens_ptr,
-    num_rejected_ptr,
-    input_ids_ptr,
-    positions_ptr,
-    query_start_loc_ptr,
-    seq_lens_ptr,
-    max_model_len,
-    max_num_reqs,
-    BLOCK_SIZE: tl.constexpr,
-    ADVANCE_DRAFT_POSITIONS: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-    num_reqs = tl.num_programs(0) - 1
-    if req_idx == num_reqs:
-        # Compute query_start_loc. Pad it with the last query_start_loc
-        # for CUDA graphs.
-        for i in range(0, max_num_reqs + 1, BLOCK_SIZE):
-            block = i + tl.arange(0, BLOCK_SIZE)
-            q = tl.where(block < num_reqs, block, num_reqs)
-            mask = block < max_num_reqs + 1
-            tl.store(query_start_loc_ptr + block, q, mask=mask)
-        # Pad seq_lens for CUDA graphs.
-        for i in range(req_idx, max_num_reqs, BLOCK_SIZE):
-            block = i + tl.arange(0, BLOCK_SIZE)
-            mask = block < max_num_reqs
-            tl.store(seq_lens_ptr + block, 0, mask=mask)
-        return
-
-    # draft token -> input id.
-    draft_token = tl.load(draft_tokens_ptr + req_idx * draft_tokens_stride)
-    tl.store(input_ids_ptr + req_idx, draft_token)
-
-    if ADVANCE_DRAFT_POSITIONS:
-        # Compute position and seq_lens.
-        # NOTE(woosuk): To prevent out-of-range access, we clamp these values
-        # if they reach the max model length.
-        position = tl.load(positions_ptr + req_idx)
-        position = tl.minimum(position + 1, max_model_len - 1)
-        tl.store(positions_ptr + req_idx, position)
-
-        target_seq_len = tl.load(target_seq_lens_ptr + req_idx)
-        num_rejected = tl.load(num_rejected_ptr + req_idx)
-        seq_len = target_seq_len - num_rejected
-        seq_len = tl.minimum(seq_len + 1, max_model_len)
-        tl.store(seq_lens_ptr + req_idx, seq_len)
-
-
-def prepare_decode_inputs(
-    draft_tokens: torch.Tensor,
-    target_seq_lens: torch.Tensor,
-    num_rejected: torch.Tensor,
-    input_buffers: InputBuffers,
-    max_model_len: int,
-    max_num_reqs: int,
-    advance_draft_positions: bool = True,
-):
-    num_reqs = draft_tokens.shape[0]
-    _prepare_decode_inputs_kernel[(num_reqs + 1,)](
-        draft_tokens,
-        draft_tokens.stride(0),
-        target_seq_lens,
-        num_rejected,
-        input_buffers.input_ids,
-        input_buffers.positions,
-        input_buffers.query_start_loc,
-        input_buffers.seq_lens,
-        max_model_len,
-        max_num_reqs,
-        BLOCK_SIZE=1024,
-        ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
-    )
-
-
-@triton.jit
-def _update_draft_inputs_kernel(
-    output_draft_tokens_ptr,
-    output_draft_tokens_stride,
-    next_input_hidden_states_ptr,
-    next_input_hidden_states_stride,
-    input_ids_ptr,
-    positions_ptr,
-    seq_lens_ptr,
-    draft_tokens_ptr,
-    current_draft_step_ptr,
-    hidden_states_ptr,
-    hidden_states_stride,
-    hidden_size,
-    max_model_len,
-    num_speculative_steps,
-    BLOCK_SIZE: tl.constexpr,
-    ADVANCE_DRAFT_POSITIONS: tl.constexpr,
-):
-    req_idx = tl.program_id(0)
-
-    # Write the sampled draft token into self.draft_tokens[req_idx, step].
-    draft_token = tl.load(draft_tokens_ptr + req_idx)
-    step = tl.load(current_draft_step_ptr)
-    tl.store(
-        output_draft_tokens_ptr + req_idx * output_draft_tokens_stride + step,
-        draft_token,
-    )
-
-    if step >= num_speculative_steps - 1:
-        # This is the final step. Skip updating draft forward inputs.
-        return
-
-    # Write the sampled draft token into the input ids tensor for the next
-    # forward pass.
-    tl.store(input_ids_ptr + req_idx, draft_token)
-
-    # Copy hidden states into the input hidden states tensor for the next
-    # forward pass.
-    for i in range(0, hidden_size, BLOCK_SIZE):
-        block = i + tl.arange(0, BLOCK_SIZE)
-        mask = block < hidden_size
-        hidden_states = tl.load(
-            hidden_states_ptr + req_idx * hidden_states_stride + block,
-            mask=mask,
-        )
-        tl.store(
-            next_input_hidden_states_ptr
-            + req_idx * next_input_hidden_states_stride
-            + block,
-            hidden_states,
-            mask=mask,
-        )
-
-    if ADVANCE_DRAFT_POSITIONS:
-        # Increment position and seq_lens.
-        # NOTE(woosuk): To prevent out-of-range access, we clamp these values
-        # if they reach the max model length.
-        position = tl.load(positions_ptr + req_idx)
-        position = tl.minimum(position + 1, max_model_len - 1)
-        tl.store(positions_ptr + req_idx, position)
-
-        seq_len = tl.load(seq_lens_ptr + req_idx)
-        seq_len = tl.minimum(seq_len + 1, max_model_len)
-        tl.store(seq_lens_ptr + req_idx, seq_len)
-
-
-def update_draft_inputs(
-    draft_tokens: torch.Tensor,
-    current_draft_step: torch.Tensor,
-    hidden_states: torch.Tensor,
-    output_draft_tokens: torch.Tensor,
-    next_input_hidden_states: torch.Tensor,
-    input_buffers: InputBuffers,
-    num_reqs: int,
-    max_model_len: int,
-    num_speculative_steps: int,
-    advance_draft_positions: bool = True,
-):
-    _, hidden_size = hidden_states.shape
-    _update_draft_inputs_kernel[(num_reqs,)](
-        output_draft_tokens,
-        output_draft_tokens.stride(0),
-        next_input_hidden_states,
-        next_input_hidden_states.stride(0),
-        input_buffers.input_ids,
-        input_buffers.positions,
-        input_buffers.seq_lens,
-        draft_tokens,
-        current_draft_step,
-        hidden_states,
-        hidden_states.stride(0),
-        hidden_size,
-        max_model_len,
-        num_speculative_steps,
-        BLOCK_SIZE=1024,
-        ADVANCE_DRAFT_POSITIONS=advance_draft_positions,
-    )

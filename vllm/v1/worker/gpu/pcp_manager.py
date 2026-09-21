@@ -12,12 +12,8 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.input_batch import (
-    InputBatch,
-    InputBuffers,
-    combine_sampled_and_draft_tokens,
-    prepare_pos_seq_lens,
-)
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.kernels import TritonKernels
 from vllm.v1.worker.gpu.states import RequestState
 
 logger = init_logger(__name__)
@@ -437,7 +433,7 @@ class PCPManager:
         local_start_pos = async_copy_to_gpu(local_start_pos_np, device=self.device)
 
         assert self._local_req_idx is not None
-        prepare_pos_seq_lens(
+        TritonKernels().prepare_pos_seq_lens(
             self._local_req_idx[:num_local_reqs],
             local_query_start_loc,
             local_start_pos,
@@ -467,7 +463,7 @@ class PCPManager:
             cu_num_logits = torch.zeros(
                 num_local_reqs + 1, device=self.device, dtype=torch.int32
             )
-        logits_indices = combine_sampled_and_draft_tokens(
+        logits_indices = TritonKernels().combine_sampled_and_draft_tokens(
             input_buffers.input_ids,
             local_to_global_req_idx,
             req_states.last_sampled_tokens,

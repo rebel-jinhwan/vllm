@@ -20,7 +20,7 @@ from vllm.v1.worker.gpu.attn_utils import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.kernels import ModelRunnerKernels
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -67,9 +67,12 @@ class BaseSpeculator(ABC):
 
 
 class DraftModelSpeculator(BaseSpeculator):
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(
+        self, vllm_config: VllmConfig, device: torch.device, kernels: ModelRunnerKernels
+    ):
         self.vllm_config = vllm_config
         self.device = device
+        self.kernels = kernels
 
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
@@ -281,7 +284,7 @@ class DraftModelSpeculator(BaseSpeculator):
             logits = self.model.compute_logits(hidden_states)
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
-            return self.gumbel_sample(
+            return self.kernels.gumbel_sample(
                 logits,
                 idx_mapping,
                 temperature,
@@ -293,31 +296,6 @@ class DraftModelSpeculator(BaseSpeculator):
                 use_fp64=self.use_fp64_gumbel,
             )
         return self._greedy_sample_draft(hidden_states)
-
-    def gumbel_sample(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        temperature: torch.Tensor,
-        seed: torch.Tensor,
-        pos: torch.Tensor,
-        apply_temperature: bool,
-        output_processed_logits: torch.Tensor | None = None,
-        output_processed_logits_col: torch.Tensor | None = None,
-        use_fp64: bool = False,
-    ) -> torch.Tensor:
-        """Kernel: a platform without Triton subclasses the speculator for it."""
-        return gumbel_sample(
-            logits,
-            expanded_idx_mapping,
-            temperature,
-            seed,
-            pos,
-            apply_temperature,
-            output_processed_logits,
-            output_processed_logits_col,
-            use_fp64,
-        )
 
     def _copy_request_inputs(
         self,

@@ -6,9 +6,9 @@ import math
 import pytest
 import torch
 
-from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
-    rejection_sample,
-)
+from vllm.v1.worker.gpu.kernels import TritonKernels
+
+rejection_sample = TritonKernels().rejection_sample
 
 VOCAB_SIZE = 4096
 

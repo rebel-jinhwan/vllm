@@ -3,9 +3,12 @@
 import torch
 
 from vllm.config import VllmConfig
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
 
-def init_speculator(vllm_config: VllmConfig, device: torch.device):
+def init_speculator(
+    vllm_config: VllmConfig, device: torch.device, kernels: ModelRunnerKernels
+):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.method == "dflash":
@@ -13,28 +16,28 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
             DFlashSpeculator,
         )
 
-        return DFlashSpeculator(vllm_config, device)
+        return DFlashSpeculator(vllm_config, device, kernels)
     elif speculative_config.method == "dspark":
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
             DSparkSpeculator,
         )
 
-        return DSparkSpeculator(vllm_config, device)
+        return DSparkSpeculator(vllm_config, device, kernels)
     elif speculative_config.use_gemma4_mtp():
         from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
             Gemma4Speculator,
         )
 
-        return Gemma4Speculator(vllm_config, device)
+        return Gemma4Speculator(vllm_config, device, kernels)
     elif speculative_config.method == "mtp":
         from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
-        return MTPSpeculator(vllm_config, device)
+        return MTPSpeculator(vllm_config, device, kernels)
     elif speculative_config.use_eagle():
         from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
             EagleSpeculator,
         )
 
-        return EagleSpeculator(vllm_config, device)
+        return EagleSpeculator(vllm_config, device, kernels)
     else:
         raise NotImplementedError(f"{speculative_config.method} is not supported yet.")

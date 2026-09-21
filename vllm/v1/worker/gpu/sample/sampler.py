@@ -13,26 +13,15 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     flashinfer_sample,
     flashinfer_sampler_supported,
 )
-from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
-from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample.bad_words import BadWordsState, apply_bad_words
-from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
-from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState, apply_logit_bias
-from vllm.v1.worker.gpu.sample.logprob import (
-    LogprobTokenIdsState,
-    compute_token_logprobs,
-    compute_token_ranks,
-    fill_logprob_token_ids,
-)
-from vllm.v1.worker.gpu.sample.min_p import apply_min_p
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+from vllm.v1.worker.gpu.sample.logprob import LogprobTokenIdsState
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
-from vllm.v1.worker.gpu.sample.penalties import (
-    PenaltiesState,
-    apply_penalties,
-    bincount,
-)
+from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
 
 class Sampler:
@@ -42,19 +31,21 @@ class Sampler:
         vocab_size: int,
         device: torch.device,
         req_states: RequestState,
+        kernels: ModelRunnerKernels,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         num_speculative_tokens: int = 1,
         use_fp64_gumbel: bool = False,
     ):
+        self.kernels = kernels
         self.logprobs_mode = logprobs_mode
         self.compute_nans = envs.VLLM_COMPUTE_NANS_IN_LOGITS  # False by default.
         self.use_fp64_gumbel = use_fp64_gumbel
 
         self.req_states = req_states
-        self.sampling_states = SamplingStates(max_num_reqs, vocab_size, self)
-        self.penalties_state = PenaltiesState(req_states, self)
-        self.logit_bias_state = LogitBiasState(max_num_reqs, device, self)
-        self.bad_words_state = BadWordsState(req_states, self)
+        self.sampling_states = SamplingStates(max_num_reqs, vocab_size, kernels)
+        self.penalties_state = PenaltiesState(req_states, kernels)
+        self.logit_bias_state = LogitBiasState(max_num_reqs, device, kernels)
+        self.bad_words_state = BadWordsState(req_states, kernels)
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.num_speculative_tokens = num_speculative_tokens
         self.use_flashinfer = flashinfer_sampler_supported()
@@ -89,7 +80,7 @@ class Sampler:
 
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
-        num_nans = self.get_num_nans(logits) if self.compute_nans else None
+        num_nans = self.kernels.get_num_nans(logits) if self.compute_nans else None
 
         return_logprobs = self.returns_logprobs(idx_mapping_np)
 
@@ -129,7 +120,7 @@ class Sampler:
         # 1 sampled token per request, except chunked-prefill requests
         # (seq_len < prefill_len) which aren't done prefilling and produce no
         # output token. num_rejected is always 0 here (one logit per request).
-        num_sampled, num_rejected = self.get_num_sampled_and_rejected(
+        num_sampled, num_rejected = self.kernels.get_num_sampled_and_rejected(
             input_batch.seq_lens.new_ones(input_batch.num_reqs),
             input_batch.seq_lens,
             input_batch.cu_num_logits,
@@ -254,7 +245,7 @@ class Sampler:
             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
         else:
             processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
-            sampled = self.gumbel_sample(
+            sampled = self.kernels.gumbel_sample(
                 processed_logits,
                 expanded_idx_mapping,
                 self.sampling_states.temperature.gpu,
@@ -264,196 +255,6 @@ class Sampler:
                 use_fp64=self.use_fp64_gumbel,
             )
         return sampled, processed_logits
-
-    # --- Kernels. A platform without Triton subclasses the sampler and
-    # implements these; everything above is device-neutral. ---
-
-    def apply_temperature(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        temperature: torch.Tensor,
-    ) -> None:
-        apply_temperature(logits, expanded_idx_mapping, temperature)
-
-    def apply_min_p(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        min_p: torch.Tensor,
-    ) -> None:
-        apply_min_p(logits, expanded_idx_mapping, min_p)
-
-    def apply_penalties(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        token_ids: torch.Tensor,
-        expanded_local_pos: torch.Tensor,
-        repetition_penalty: torch.Tensor,
-        frequency_penalty: torch.Tensor,
-        presence_penalty: torch.Tensor,
-        prompt_bin_mask: torch.Tensor,
-        output_bin_counts: torch.Tensor,
-    ) -> None:
-        apply_penalties(
-            logits,
-            expanded_idx_mapping,
-            token_ids,
-            expanded_local_pos,
-            repetition_penalty,
-            frequency_penalty,
-            presence_penalty,
-            prompt_bin_mask,
-            output_bin_counts,
-        )
-
-    def bincount(
-        self,
-        expanded_idx_mapping: torch.Tensor,
-        all_token_ids: torch.Tensor,
-        prompt_len: torch.Tensor,
-        prefill_len: torch.Tensor,
-        prompt_bin_mask: torch.Tensor,
-        output_bin_counts: torch.Tensor,
-        max_prefill_len: int,
-    ) -> None:
-        bincount(
-            expanded_idx_mapping,
-            all_token_ids,
-            prompt_len,
-            prefill_len,
-            prompt_bin_mask,
-            output_bin_counts,
-            max_prefill_len,
-        )
-
-    def apply_logit_bias(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        pos: torch.Tensor,
-        num_allowed_token_ids: torch.Tensor,
-        allowed_token_ids: torch.Tensor,
-        num_logit_bias: torch.Tensor,
-        logit_bias_token_ids: torch.Tensor,
-        logit_bias: torch.Tensor,
-        min_lens: torch.Tensor,
-        num_stop_token_ids: torch.Tensor,
-        stop_token_ids: torch.Tensor,
-    ) -> None:
-        apply_logit_bias(
-            logits,
-            expanded_idx_mapping,
-            pos,
-            num_allowed_token_ids,
-            allowed_token_ids,
-            num_logit_bias,
-            logit_bias_token_ids,
-            logit_bias,
-            min_lens,
-            num_stop_token_ids,
-            stop_token_ids,
-        )
-
-    def apply_bad_words(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        bad_word_token_ids: torch.Tensor,
-        bad_word_offsets: torch.Tensor,
-        num_bad_words: torch.Tensor,
-        all_token_ids: torch.Tensor,
-        prompt_len: torch.Tensor,
-        total_len: torch.Tensor,
-        input_ids: torch.Tensor,
-        expanded_local_pos: torch.Tensor,
-        max_num_bad_words: int,
-    ) -> None:
-        apply_bad_words(
-            logits,
-            expanded_idx_mapping,
-            bad_word_token_ids,
-            bad_word_offsets,
-            num_bad_words,
-            all_token_ids,
-            prompt_len,
-            total_len,
-            input_ids,
-            expanded_local_pos,
-            max_num_bad_words,
-        )
-
-    def gumbel_sample(
-        self,
-        logits: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        temperature: torch.Tensor,
-        seed: torch.Tensor,
-        pos: torch.Tensor,
-        apply_temperature: bool,
-        output_processed_logits: torch.Tensor | None = None,
-        output_processed_logits_col: torch.Tensor | None = None,
-        use_fp64: bool = False,
-    ) -> torch.Tensor:
-        return gumbel_sample(
-            logits,
-            expanded_idx_mapping,
-            temperature,
-            seed,
-            pos,
-            apply_temperature,
-            output_processed_logits,
-            output_processed_logits_col,
-            use_fp64,
-        )
-
-    def compute_token_logprobs(
-        self, logits: torch.Tensor, token_ids: torch.Tensor
-    ) -> torch.Tensor:
-        return compute_token_logprobs(logits, token_ids)
-
-    def compute_token_ranks(
-        self, logits: torch.Tensor, token_ids: torch.Tensor
-    ) -> torch.Tensor:
-        return compute_token_ranks(logits, token_ids)
-
-    def fill_logprob_token_ids(
-        self,
-        out_token_ids: torch.Tensor,
-        out_valid_mask: torch.Tensor,
-        sampled_token_ids: torch.Tensor,
-        topk_token_ids: torch.Tensor,
-        expanded_idx_mapping: torch.Tensor,
-        num_per_req_token_ids: torch.Tensor,
-        per_req_token_ids: torch.Tensor,
-        num_topk: int,
-    ) -> None:
-        fill_logprob_token_ids(
-            out_token_ids,
-            out_valid_mask,
-            sampled_token_ids,
-            topk_token_ids,
-            expanded_idx_mapping,
-            num_per_req_token_ids,
-            per_req_token_ids,
-            num_topk,
-        )
-
-    def get_num_nans(self, logits: torch.Tensor) -> torch.Tensor:
-        return get_num_nans(logits)
-
-    def get_num_sampled_and_rejected(
-        self,
-        num_sampled: torch.Tensor,
-        seq_lens: torch.Tensor,
-        cu_num_logits: torch.Tensor,
-        idx_mapping: torch.Tensor,
-        prefill_len: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return get_num_sampled_and_rejected(
-            num_sampled, seq_lens, cu_num_logits, idx_mapping, prefill_len
-        )
 
     def compute_topk_scores(
         self,
@@ -477,7 +278,7 @@ class Sampler:
             if logits_mode:
                 scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
             else:
-                scores = self.compute_token_logprobs(logits, logprob_token_ids)
+                scores = self.kernels.compute_token_logprobs(logits, logprob_token_ids)
         else:
             # Some requests specified logprob_token_ids: build the [batch_size,
             # 1 + max_cols] token_ids matrix and validity mask, overriding the
@@ -492,7 +293,7 @@ class Sampler:
             num_cols = max(num_logprobs, max_per_req_token_ids)
             logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
             valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
-            self.fill_logprob_token_ids(
+            self.kernels.fill_logprob_token_ids(
                 logprob_token_ids,
                 valid_mask,
                 sampled_token_ids,
@@ -505,11 +306,13 @@ class Sampler:
             if logits_mode:
                 scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
             else:
-                scores = self.compute_token_logprobs(logits, logprob_token_ids)
+                scores = self.kernels.compute_token_logprobs(logits, logprob_token_ids)
             scores = scores.masked_fill(~valid_mask, float("-inf"))
         return LogprobsTensors(
             logprob_token_ids=logprob_token_ids,
             logprobs=scores,
-            selected_token_ranks=self.compute_token_ranks(logits, sampled_token_ids),
+            selected_token_ranks=self.kernels.compute_token_ranks(
+                logits, sampled_token_ids
+            ),
             cu_num_generated_tokens=cu_num_logits,
         )

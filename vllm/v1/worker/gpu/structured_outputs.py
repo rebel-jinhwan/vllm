@@ -3,15 +3,22 @@
 import numpy as np
 import torch
 
-from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.worker.gpu.async_utils import stream
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
 
 class StructuredOutputsWorker:
-    def __init__(self, max_num_logits: int, vocab_size: int, device: torch.device):
+    def __init__(
+        self,
+        max_num_logits: int,
+        vocab_size: int,
+        device: torch.device,
+        kernels: ModelRunnerKernels,
+    ):
+        self.kernels = kernels
         self.logits_indices = torch.zeros(
             max_num_logits, dtype=torch.int32, device=device
         )
@@ -62,63 +69,8 @@ class StructuredOutputsWorker:
         current_stream.wait_stream(self.copy_stream)
 
         assert bitmask.shape[0] == len(mapping)
-        self.apply_bitmask(logits, logits_indices, bitmask)
+        self.kernels.apply_grammar_bitmask(logits, logits_indices, bitmask)
 
         # Ensure the copy stream waits for the device tensors to finish being used
         # before it re-uses or deallocates them
         self.copy_stream.wait_stream(current_stream)
-
-
-    def apply_bitmask(
-        self, logits: torch.Tensor, logits_indices: torch.Tensor, bitmask: torch.Tensor
-    ) -> None:
-        """Kernel: mask to -inf the vocabulary entries whose bit is clear, per
-        row of `logits_indices`. A platform without Triton subclasses the
-        worker for it."""
-        num_masks, vocab_size = bitmask.shape[0], logits.shape[-1]
-        BLOCK_SIZE = 8192
-        grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
-        _apply_grammar_bitmask_kernel[grid](
-            logits,
-            logits.stride(0),
-            logits_indices,
-            bitmask,
-            bitmask.stride(0),
-            vocab_size,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-
-
-# Adapted from
-# https://github.com/mlc-ai/xgrammar/blob/main/python/xgrammar/kernels/apply_token_bitmask_inplace_triton.py
-@triton.jit
-def _apply_grammar_bitmask_kernel(
-    logits_ptr,
-    logits_stride,
-    logits_indices_ptr,
-    bitmask_ptr,
-    bitmask_stride,
-    vocab_size,
-    BLOCK_SIZE: tl.constexpr,
-):
-    bitmask_idx = tl.program_id(0)
-    logits_idx = tl.load(logits_indices_ptr + bitmask_idx)
-
-    # Load the bitmask.
-    block_id = tl.program_id(1)
-    bitmask_offset = (block_id * BLOCK_SIZE) // 32 + tl.arange(0, BLOCK_SIZE // 32)
-    packed_bitmask = tl.load(
-        bitmask_ptr + bitmask_idx * bitmask_stride + bitmask_offset,
-        mask=bitmask_offset < bitmask_stride,
-    )
-    # Unpack the bitmask.
-    bitmask = ((packed_bitmask[:, None] >> (tl.arange(0, 32)[None, :])) & 1) == 0
-    bitmask = bitmask.reshape(BLOCK_SIZE)
-
-    # Apply the bitmask to the logits.
-    block_offset = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    tl.store(
-        logits_ptr + logits_idx * logits_stride + block_offset,
-        -float("inf"),
-        mask=bitmask & (block_offset < vocab_size),
-    )

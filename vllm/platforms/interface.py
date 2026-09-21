@@ -996,8 +996,8 @@ class Platform:
         sampling kernels (vllm/v1/worker/gpu/) can run on this platform.
 
         They are Triton kernels, so the default answer is whether Triton is
-        usable. A platform whose runner, sampler and speculator subclasses
-        implement the kernel methods themselves returns True."""
+        usable. A platform whose `GPUModelRunner.init_kernels()` returns its
+        own `ModelRunnerKernels` returns True."""
         from vllm.triton_utils import HAS_TRITON
 
         return HAS_TRITON

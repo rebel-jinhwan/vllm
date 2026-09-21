@@ -21,7 +21,9 @@ pytest.importorskip("triton")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required for Gumbel sampler tests", allow_module_level=True)
 
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.kernels import TritonKernels
+
+gumbel_sample = TritonKernels().gumbel_sample
 
 DEVICE = "cuda"
 VOCAB_SIZE = 200_000

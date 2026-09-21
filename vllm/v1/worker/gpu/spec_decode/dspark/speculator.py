@@ -29,16 +29,18 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
 
 class DSparkSpeculator(DFlashSpeculator):
     _speculator_name = "DSpark"
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
+    def __init__(
+        self, vllm_config: VllmConfig, device: torch.device, kernels: ModelRunnerKernels
+    ):
+        super().__init__(vllm_config, device, kernels)
 
         # Anchor-as-first (N slots) unless the checkpoint uses the 1+N fill-in
         # block, where the anchor is a separate bonus token.
@@ -129,7 +131,7 @@ class DSparkSpeculator(DFlashSpeculator):
                     logits_i = buf
                 # sample_pos is the predicted token's position Q; the target
                 # verifies it with the predecessor's Gumbel key (Q-1). Pass Q-1.
-                draft_sampled_i = gumbel_sample(
+                draft_sampled_i = self.kernels.gumbel_sample(
                     logits_i,
                     idx_map[:, i],
                     self.temperature,

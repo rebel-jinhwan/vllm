@@ -53,7 +53,6 @@ from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor, async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_states.interface import ModelState
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import use_penalty
 from vllm.v1.worker.gpu.states import RequestState
@@ -1062,6 +1061,7 @@ class DiffusionSampler:
         tp_size: int = 1,
         tp_group_name: str = "",
     ):
+        self.sampler = sampler
         self.sampling_states = sampler.sampling_states
         self.req_states = sampler.req_states
         self.logits_mode = sampler.logprobs_mode in ("raw_logits", "processed_logits")
@@ -1360,11 +1360,13 @@ class DiffusionSampler:
                         # positions are never emitted.
                         k_i = int(valid_canvas_len_np[start_req + li])
                         pos = li * CL
-                        self._pending_logprobs[slot.item()] = compute_topk_scores(
-                            flat_logits[pos : pos + k_i],
-                            max_num_logprobs,
-                            argmax_tokens[local_idx][:k_i],
-                            logits_mode=self.logits_mode,
+                        self._pending_logprobs[slot.item()] = (
+                            self.sampler.compute_topk_scores(
+                                flat_logits[pos : pos + k_i],
+                                max_num_logprobs,
+                                argmax_tokens[local_idx][:k_i],
+                                logits_mode=self.logits_mode,
+                            )
                         )
 
         # Commit steps: is_committing was True at entry. Reassemble previously

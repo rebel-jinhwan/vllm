@@ -15,7 +15,9 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
+from vllm.v1.worker.gpu.kernels import TritonKernels
+
+rejection_sample = TritonKernels().rejection_sample
 
 VOCAB_SIZE = 155264
 NUM_SPECULATIVE_STEPS = 2
