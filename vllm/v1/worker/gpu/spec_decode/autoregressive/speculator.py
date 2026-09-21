@@ -125,6 +125,31 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             progress_bar_desc="Capturing decode CUDA graphs",
         )
 
+    def dispatch_batch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        *,
+        decode: bool,
+        need_eager: bool,
+    ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
+        """Decide the shape a draft pass runs at, agreed across DP ranks: the
+        first pass over the target's tokens (`decode=False`) or one of the
+        one-token-per-request passes after it (`decode=True`).
+
+        Out-of-tree hardware speculators override this to pick from the
+        shapes they compiled and to run their own DP agreement."""
+        return dispatch_cg_and_sync_dp(
+            self.decode_cudagraph_manager if decode else self.prefill_cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            need_eager=need_eager,
+        )
+
     @torch.inference_mode()
     def propose(
         self,
@@ -205,13 +230,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             input_batch.num_tokens,
             max_query_len,
         )
-        prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.prefill_cudagraph_manager,
+        prefill_batch_desc, num_tokens_across_dp = self.dispatch_batch(
             num_reqs,
             num_tokens,
             uniform_token_count,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
+            decode=False,
             need_eager=is_profile,
         )
 
@@ -252,14 +275,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         # Each request produces exactly 1 token per draft generation step,
         # enabling FULL graph replay.
-        decode_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.decode_cudagraph_manager,
-            num_reqs,
-            num_reqs,
-            uniform_token_count=1,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=is_profile,
+        decode_batch_desc, num_tokens_across_dp = self.dispatch_batch(
+            num_reqs, num_reqs, 1, decode=True, need_eager=is_profile
         )
 
         # Generate the remaining num_speculative_steps - 1 draft tokens.
