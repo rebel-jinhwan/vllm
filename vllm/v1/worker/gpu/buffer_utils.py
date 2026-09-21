@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
     async_tensor_h2d,
@@ -39,14 +39,15 @@ class UvaBuffer:
 
 
 class NonUvaBuffer:
-    """Explicit-copy fallback for platforms without pinned memory."""
+    """Explicit-copy fallback for platforms without UVA: the device reads a
+    mirror that every `uva()` call refreshes from the host tensor."""
 
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         from vllm.platforms import current_platform
 
         logger.warning_once(
-            "Pinned memory is not available on this platform; falling back "
-            "to device memory for UVA buffers."
+            "UVA is not available on this platform; falling back to device "
+            "mirrors for UVA buffers."
         )
         self.cpu = torch.zeros(size, dtype=dtype, device="cpu")
         self.np = self.cpu.numpy()
@@ -255,6 +256,12 @@ class FusedStagedWriter:
         output_strides: torch.Tensor,
     ) -> None:
         """Apply and clear the staged writes of `tensors` with one kernel."""
+        if not HAS_TRITON:
+            # The fused kernel reaches each output through a raw pointer table,
+            # which only a Triton kernel can dereference.
+            for t in tensors:
+                t.apply_write()
+            return
         group_ids: list[int] = []
         indices: list[int] = []
         starts: list[int] = []

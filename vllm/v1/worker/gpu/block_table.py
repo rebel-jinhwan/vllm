@@ -4,7 +4,7 @@ from collections.abc import Iterable
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.buffer_utils import (
     FusedStagedWriter,
@@ -162,6 +162,15 @@ class BlockTables:
             assert out_ptrs is not None
             assert len(out) == self.num_kv_cache_groups
         num_reqs = idx_mapping.shape[0]
+        if not HAS_TRITON:
+            # The kernel reaches the block tables through a raw pointer table,
+            # which only a Triton kernel can dereference.
+            rows = idx_mapping.long()
+            for group_id in range(self.num_kv_cache_groups):
+                dst = out[group_id]
+                dst[:num_reqs] = self.block_tables[group_id].gpu[rows]
+                dst[num_reqs:num_reqs_padded].zero_()
+            return tuple(bt[:num_reqs_padded] for bt in out)
         # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
             idx_mapping,
@@ -201,6 +210,25 @@ class BlockTables:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
+        if not HAS_TRITON:
+            # As in gather_block_tables: the kernel takes a pointer table.
+            assert self.cp_size == 1, (
+                "context parallelism needs the Triton slot-mapping kernel"
+            )
+            qsl = query_start_loc[: num_reqs + 1].long()
+            num_tokens = int(qsl[-1])
+            lens = qsl[1:] - qsl[:-1]
+            rows = idx_mapping.long().repeat_interleave(lens, output_size=num_tokens)
+            pos = positions[:num_tokens].long()
+            for group_id in range(num_groups):
+                block_size = self.kernel_block_sizes[group_id]
+                block_table = self.block_tables[group_id].gpu
+                block_numbers = block_table[rows, pos // block_size].long()
+                slot_mappings[group_id, :num_tokens] = (
+                    block_numbers * block_size + pos % block_size
+                )
+                slot_mappings[group_id, num_tokens:] = PAD_SLOT_ID
+            return slot_mappings[:, :num_tokens_padded]
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
             slot_mappings.shape[1],
             idx_mapping,

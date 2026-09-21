@@ -6,6 +6,7 @@ import functools
 import os
 import platform
 import sys
+from collections.abc import Callable
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -990,6 +991,26 @@ class Platform:
 
         return CpuArchEnum.OTHER if machine else CpuArchEnum.UNKNOWN
 
+    def supports_uva(self) -> bool:
+        """Whether a pinned host tensor can be mapped into the device address
+        space (Unified Virtual Addressing), so a kernel reads host memory in
+        place. Without it, host-side buffers keep an explicit device mirror."""
+        return (
+            self.is_cuda_alike() or self.is_xpu()
+        ) and self.is_pin_memory_available()
+
+    @classmethod
+    def get_kernel_impl(cls, kernel: str) -> Callable[..., Any] | None:
+        """An implementation of the named vLLM Triton kernel for a platform
+        without Triton, or None.
+
+        `kernel` is the kernel's qualified name, such as
+        `vllm.v1.worker.gpu.input_batch._prepare_pos_seq_lens_kernel`. The
+        implementation is called as `impl(grid, *args, **constexpr)` with the
+        launch grid and the kernel's own arguments, tensors where the kernel
+        takes pointers, and must have the kernel's effect on them."""
+        return None
+
     @classmethod
     def is_pin_memory_available(cls) -> bool:
         """Checks whether pin memory is available on the current platform."""
@@ -1144,9 +1165,8 @@ class Platform:
         sampling kernels (vllm/v1/worker/gpu/) can run on this platform.
 
         They are Triton kernels, so the default answer is whether Triton is
-        usable. An out-of-tree platform that supplies its own implementations
-        of those kernels returns True, so the V2 model runner is not tied to
-        Triton being importable."""
+        usable. A platform that supplies its own implementations of those
+        kernels through `get_kernel_impl` returns True."""
         from vllm.triton_utils import HAS_TRITON
 
         return HAS_TRITON
