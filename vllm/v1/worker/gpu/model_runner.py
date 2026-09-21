@@ -108,12 +108,19 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
-from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.speculator import (
+    BaseSpeculator,
+    DraftModelSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
+from vllm.v1.worker.utils import (
+    AttentionGroup,
+    KVBlockZeroer,
+    copy_kv_cache_blocks_inplace,
+)
 
 logger = init_logger(__name__)
 
@@ -192,7 +199,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
-                self.speculator = init_speculator(self.vllm_config, self.device)
+                self.speculator = self.init_speculator()
 
             if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
                 # Drafting may require auxiliary hidden states from target model outputs
@@ -405,12 +412,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Cache the default stream to avoid lookup overhead.
         return torch.accelerator.current_stream(self.device)
 
-    # Out-of-tree hardware runners can select the class that picks a step's
-    # batch shape and replays or dispatches its graph.
-    @property
-    def cudagraph_manager_cls(self) -> type[ModelCudaGraphManager]:
-        return ModelCudaGraphManager
-
     def get_kv_cache_spec(self):
         return get_kv_cache_spec(self.vllm_config)
 
@@ -484,7 +485,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_config=self.kv_cache_config,
             max_num_reqs=self.max_num_reqs,
         )
-        self.cudagraph_manager = self.cudagraph_manager_cls(
+        self.cudagraph_manager = ModelCudaGraphManager(
             self.vllm_config,
             self.device,
             cudagraph_mode,
@@ -1195,13 +1196,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.cudagraph_manager,
+        batch_desc, num_tokens_across_dp = self.dispatch_batch(
+            scheduler_output,
             num_reqs,
             num_toks,
             uniform_tok_count,
-            self.dp_size,
-            self.dp_rank,
+            max_query_len,
+            dummy_run=dummy_run,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
         )
@@ -1260,13 +1261,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mappings, self.kv_cache_config
             )
             assert block_tables is not None
-            attn_metadata = self.model_state.prepare_attn(
-                input_batch,
-                batch_desc.cg_mode,
-                block_tables,
-                slot_mappings,
-                self.attn_groups,
-                self.kv_cache_config,
+            attn_metadata = self.build_attn_metadata(
+                input_batch, batch_desc, block_tables, slot_mappings, self.attn_groups
             )
 
         input_ids = input_batch.input_ids
@@ -1366,6 +1362,68 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors
         return None
+
+    def init_speculator(self) -> BaseSpeculator:
+        """The drafter for the configured speculative method.
+
+        Out-of-tree hardware runners override this to run the draft on their
+        own graphs; upstream's `AutoRegressiveSpeculator` drives it eagerly."""
+        return init_speculator(self.vllm_config, self.device)
+
+    def dispatch_batch(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        max_query_len: int,
+        *,
+        dummy_run: bool,
+        need_eager: bool,
+        num_active_loras: int,
+    ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
+        """Decide the shape this step runs at, agreed across DP ranks: the
+        padded request and token counts and the graph mode.
+
+        Out-of-tree hardware runners override this to pick from the shapes
+        they compiled and to run their own DP agreement. `scheduler_output`
+        is passed for what the counts do not carry, such as the step's
+        phase. A descriptor with `num_tokens == 0` skips the forward."""
+        return dispatch_cg_and_sync_dp(
+            self.cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            self.dp_size,
+            self.dp_rank,
+            need_eager=need_eager,
+            num_active_loras=num_active_loras,
+        )
+
+    def build_attn_metadata(
+        self,
+        input_batch: InputBatch,
+        batch_desc: BatchExecutionDescriptor,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        *,
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
+        """Per-layer attention metadata for this step.
+
+        Out-of-tree hardware runners override this when their attention
+        backend's builder takes inputs the in-tree builders do not, such as
+        host-side positions or a padded batch dimension."""
+        return self.model_state.prepare_attn(
+            input_batch,
+            batch_desc.cg_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            self.kv_cache_config,
+            for_capture=for_capture,
+        )
 
     @torch.inference_mode()
     @step_eplb_after()
