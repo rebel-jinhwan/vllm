@@ -61,9 +61,21 @@ class StructuredOutputsWorker:
         # Ensure all async copies are complete before launching the kernel.
         current_stream.wait_stream(self.copy_stream)
 
-        num_masks = bitmask.shape[0]
-        assert num_masks == len(mapping)
-        vocab_size = logits.shape[-1]
+        assert bitmask.shape[0] == len(mapping)
+        self.apply_bitmask(logits, logits_indices, bitmask)
+
+        # Ensure the copy stream waits for the device tensors to finish being used
+        # before it re-uses or deallocates them
+        self.copy_stream.wait_stream(current_stream)
+
+
+    def apply_bitmask(
+        self, logits: torch.Tensor, logits_indices: torch.Tensor, bitmask: torch.Tensor
+    ) -> None:
+        """Kernel: mask to -inf the vocabulary entries whose bit is clear, per
+        row of `logits_indices`. A platform without Triton subclasses the
+        worker for it."""
+        num_masks, vocab_size = bitmask.shape[0], logits.shape[-1]
         BLOCK_SIZE = 8192
         grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
         _apply_grammar_bitmask_kernel[grid](
@@ -75,10 +87,6 @@ class StructuredOutputsWorker:
             vocab_size,
             BLOCK_SIZE=BLOCK_SIZE,
         )
-
-        # Ensure the copy stream waits for the device tensors to finish being used
-        # before it re-uses or deallocates them
-        self.copy_stream.wait_stream(current_stream)
 
 
 # Adapted from

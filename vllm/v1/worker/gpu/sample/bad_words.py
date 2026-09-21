@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
@@ -8,13 +10,17 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 from vllm.v1.worker.gpu.states import RequestState
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
 MAX_BAD_WORDS_TOTAL_TOKENS = 1024  # Max total tokens for all bad words per request
 MAX_NUM_BAD_WORDS = 128  # Max number of bad words per request
 
 
 class BadWordsState:
-    def __init__(self, req_states: RequestState):
+    def __init__(self, req_states: RequestState, sampler: "Sampler"):
         self.req_states = req_states
+        self.sampler = sampler
         self.max_num_reqs = req_states.max_num_reqs
         self.device = req_states.device
 
@@ -82,7 +88,7 @@ class BadWordsState:
             # No request uses bad words. Skip the kernel launch.
             return
 
-        apply_bad_words(
+        self.sampler.apply_bad_words(
             logits,
             expanded_idx_mapping,
             self.bad_word_token_ids.gpu,

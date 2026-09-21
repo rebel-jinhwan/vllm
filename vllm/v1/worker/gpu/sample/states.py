@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
-from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
-from vllm.v1.worker.gpu.sample.min_p import apply_min_p
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 NO_LOGPROBS = -1
 _NP_INT64_MIN = np.iinfo(np.int64).min
@@ -15,7 +18,8 @@ _NP_INT64_MAX = np.iinfo(np.int64).max
 
 
 class SamplingStates:
-    def __init__(self, max_num_reqs: int, vocab_size: int):
+    def __init__(self, max_num_reqs: int, vocab_size: int, sampler: "Sampler"):
+        self.sampler = sampler
         self.max_num_reqs = max_num_reqs
         self.vocab_size = vocab_size
 
@@ -78,7 +82,9 @@ class SamplingStates:
             # No request requires temperature. Skip the kernel launch.
             return
 
-        apply_temperature(logits, expanded_idx_mapping, self.temperature.gpu)
+        self.sampler.apply_temperature(
+            logits, expanded_idx_mapping, self.temperature.gpu
+        )
 
     def apply_min_p(
         self,
@@ -89,7 +95,7 @@ class SamplingStates:
         if np.all(self.min_p.np[idx_mapping_np] == 0.0):
             # No request uses min_p. Skip the kernel launch.
             return
-        apply_min_p(logits, expanded_idx_mapping, self.min_p.gpu)
+        self.sampler.apply_min_p(logits, expanded_idx_mapping, self.min_p.gpu)
 
     def get_top_k_top_p(
         self, expanded_idx_mapping: torch.Tensor, idx_mapping_np: np.ndarray

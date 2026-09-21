@@ -6,12 +6,7 @@ from vllm.config import SpeculativeConfig
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
-from vllm.v1.worker.gpu.input_batch import (
-    InputBatch,
-    get_num_sampled_and_rejected,
-)
-from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
@@ -77,21 +72,15 @@ class RejectionSampler:
         if max_num_logprobs == NO_LOGPROBS:
             return None
 
-        num_reqs = input_batch.cu_num_logits.shape[0] - 1
         num_logits = logits.shape[0]
         flat_sampled = torch.zeros(
             num_logits, dtype=sampled.dtype, device=sampled.device
         )
-        _flatten_sampled_kernel[(num_reqs,)](
-            flat_sampled,
-            sampled,
-            sampled.stride(0),
-            num_sampled,
-            input_batch.cu_num_logits,
-            num_warps=1,
+        self.flatten_sampled(
+            flat_sampled, sampled, num_sampled, input_batch.cu_num_logits
         )
         expanded_logits = num_logits != input_batch.idx_mapping.shape[0]
-        return compute_topk_scores(
+        return self.sampler.compute_topk_scores(
             logits,
             max_num_logprobs,
             flat_sampled,
@@ -108,7 +97,9 @@ class RejectionSampler:
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
-        num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+        num_nans = (
+            self.sampler.get_num_nans(logits) if self.sampler.compute_nans else None
+        )
 
         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
         pos = input_batch.positions[input_batch.logits_indices]
@@ -120,7 +111,7 @@ class RejectionSampler:
             draft_sampled,
             input_batch.expanded_local_pos,
         )
-        sampled, num_sampled = rejection_sample(
+        sampled, num_sampled = self.rejection_sample(
             processed_logits,
             draft_logits,
             draft_sampled,
@@ -145,7 +136,7 @@ class RejectionSampler:
             else logits,
         )
 
-        num_sampled, num_rejected = get_num_sampled_and_rejected(
+        num_sampled, num_rejected = self.sampler.get_num_sampled_and_rejected(
             num_sampled,
             input_batch.seq_lens,
             input_batch.cu_num_logits,
@@ -159,4 +150,58 @@ class RejectionSampler:
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+        )
+
+    # --- Kernels. A platform without Triton subclasses the rejection sampler
+    # and implements these. ---
+
+    def rejection_sample(
+        self,
+        target_logits: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+        draft_sampled: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        pos: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        expanded_idx_mapping: torch.Tensor,
+        expanded_local_pos: torch.Tensor,
+        temperature: torch.Tensor,
+        seed: torch.Tensor,
+        num_speculative_steps: int,
+        synthetic_conditional_rates: torch.Tensor | None = None,
+        use_fp64: bool = False,
+        use_block_verification: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return rejection_sample(
+            target_logits,
+            draft_logits,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            idx_mapping,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperature,
+            seed,
+            num_speculative_steps,
+            synthetic_conditional_rates,
+            use_fp64=use_fp64,
+            use_block_verification=use_block_verification,
+        )
+
+    def flatten_sampled(
+        self,
+        flat_sampled: torch.Tensor,
+        sampled: torch.Tensor,
+        num_sampled: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+    ) -> None:
+        num_reqs = num_sampled.shape[0]
+        _flatten_sampled_kernel[(num_reqs,)](
+            flat_sampled,
+            sampled,
+            sampled.stride(0),
+            num_sampled,
+            cu_num_logits,
+            num_warps=1,
         )

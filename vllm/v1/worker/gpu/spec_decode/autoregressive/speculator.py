@@ -125,6 +125,79 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             progress_bar_desc="Capturing decode CUDA graphs",
         )
 
+    # --- Kernels over the draft's input buffers. A platform without Triton
+    # subclasses the speculator and implements these. ---
+
+    def prepare_prefill_inputs(
+        self,
+        last_token_indices: torch.Tensor,
+        current_draft_step: torch.Tensor,
+        input_buffers: InputBuffers,
+        input_batch: InputBatch,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        max_num_reqs: int,
+    ) -> torch.Tensor:
+        return prepare_prefill_inputs(
+            last_token_indices,
+            current_draft_step,
+            input_buffers,
+            input_batch,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            max_num_reqs,
+        )
+
+    def prepare_decode_inputs(
+        self,
+        draft_tokens: torch.Tensor,
+        target_seq_lens: torch.Tensor,
+        num_rejected: torch.Tensor,
+        input_buffers: InputBuffers,
+        max_model_len: int,
+        max_num_reqs: int,
+        advance_draft_positions: bool = True,
+    ) -> None:
+        prepare_decode_inputs(
+            draft_tokens,
+            target_seq_lens,
+            num_rejected,
+            input_buffers,
+            max_model_len,
+            max_num_reqs,
+            advance_draft_positions=advance_draft_positions,
+        )
+
+    def update_draft_inputs(
+        self,
+        draft_tokens: torch.Tensor,
+        current_draft_step: torch.Tensor,
+        hidden_states: torch.Tensor,
+        output_draft_tokens: torch.Tensor,
+        next_input_hidden_states: torch.Tensor,
+        input_buffers: InputBuffers,
+        num_reqs: int,
+        max_model_len: int,
+        num_speculative_steps: int,
+        advance_draft_positions: bool = True,
+    ) -> None:
+        update_draft_inputs(
+            draft_tokens,
+            current_draft_step,
+            hidden_states,
+            output_draft_tokens,
+            next_input_hidden_states,
+            input_buffers,
+            num_reqs,
+            max_model_len,
+            num_speculative_steps,
+            advance_draft_positions=advance_draft_positions,
+        )
+
     def dispatch_batch(
         self,
         num_reqs: int,
@@ -209,7 +282,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Get the input ids and last token indices for the speculator.
-        prepare_prefill_inputs(
+        self.prepare_prefill_inputs(
             self.last_token_indices,
             self.current_draft_step,
             self.input_buffers,
@@ -263,7 +336,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             return self.draft_tokens[:num_reqs, :1]
 
         # Prepare the inputs for the decode steps.
-        prepare_decode_inputs(
+        self.prepare_decode_inputs(
             self.draft_tokens[:num_reqs, 0],
             input_batch.seq_lens,
             num_rejected,
@@ -471,7 +544,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Update the inputs for the next step.
-        update_draft_inputs(
+        self.update_draft_inputs(
             draft_tokens,
             self.current_draft_step,
             hidden_states,

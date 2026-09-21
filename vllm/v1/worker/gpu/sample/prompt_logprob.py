@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -10,12 +11,20 @@ from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 
 class PromptLogprobsWorker:
-    def __init__(self, max_num_reqs: int, logprobs_mode: LogprobsMode = "raw_logprobs"):
+    def __init__(
+        self,
+        max_num_reqs: int,
+        sampler: "Sampler",
+        logprobs_mode: LogprobsMode = "raw_logprobs",
+    ):
         self.max_num_reqs = max_num_reqs
+        self.sampler = sampler
         self.logprobs_mode = logprobs_mode
 
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
@@ -32,6 +41,19 @@ class PromptLogprobsWorker:
 
     def remove_request(self, req_id: str) -> None:
         self.in_progress_prompt_logprobs.pop(req_id, None)
+
+    def get_prompt_logprobs_token_ids(
+        self,
+        num_tokens: int,
+        query_start_loc: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        all_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Kernel: a platform without Triton subclasses the worker for it."""
+        return get_prompt_logprobs_token_ids(
+            num_tokens, query_start_loc, idx_mapping, num_computed_tokens, all_token_ids
+        )
 
     def compute_prompt_logprobs(
         self,
@@ -71,7 +93,7 @@ class PromptLogprobsWorker:
         )
 
         # Get the prompt logprobs token_ids.
-        prompt_logprobs_token_ids = get_prompt_logprobs_token_ids(
+        prompt_logprobs_token_ids = self.get_prompt_logprobs_token_ids(
             input_batch.num_tokens,
             input_batch.query_start_loc,
             input_batch.idx_mapping,
@@ -84,6 +106,7 @@ class PromptLogprobsWorker:
                 hidden_states[: input_batch.num_tokens],
                 logits_fn,
                 max_num_prompt_logprobs,
+                self.sampler.compute_topk_scores,
                 self.logprobs_mode,
             )
         )
@@ -209,6 +232,7 @@ def compute_prompt_logprobs_with_chunking(
     prompt_hidden_states: torch.Tensor,
     logits_fn: Callable[[torch.Tensor], torch.Tensor],
     num_prompt_logprobs: int,
+    compute_topk_scores: Callable[..., LogprobsTensors],
     logprobs_mode: LogprobsMode = "raw_logprobs",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,

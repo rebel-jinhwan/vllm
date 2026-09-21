@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
@@ -10,10 +12,14 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.states import RequestState
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
 
 class PenaltiesState:
-    def __init__(self, req_states: RequestState):
+    def __init__(self, req_states: RequestState, sampler: "Sampler"):
         self.req_states = req_states
+        self.sampler = sampler
 
         max_num_reqs = req_states.max_num_reqs
         self.vocab_size = req_states.vocab_size
@@ -63,7 +69,7 @@ class PenaltiesState:
 
             prefill_lens = self.req_states.prefill_len.np[self._new_penalties_reqs]
             max_prefill_len = int(prefill_lens.max())
-            bincount(
+            self.sampler.bincount(
                 idx_mapping,
                 self.req_states.all_token_ids.gpu,
                 self.req_states.prompt_len.gpu,
@@ -90,7 +96,7 @@ class PenaltiesState:
             # No request uses penalties. Skip the kernel launch.
             return
 
-        apply_penalties(
+        self.sampler.apply_penalties(
             logits,
             expanded_idx_mapping,
             input_ids,

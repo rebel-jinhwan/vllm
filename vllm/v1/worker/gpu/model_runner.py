@@ -332,34 +332,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Initialize samplers. Model states may override via custom_sampler().
         if self.is_last_pp_rank and not self.is_pooling_model:
-            self.sampler = Sampler(
-                max_num_reqs=self.max_num_reqs,
-                vocab_size=self.vocab_size,
-                device=self.device,
-                req_states=self.req_states,
-                logprobs_mode=self.model_config.logprobs_mode,
-                num_speculative_tokens=self.decode_query_len,
-                use_fp64_gumbel=self.model_config.use_fp64_gumbel,
-            )
+            self.sampler = self.init_sampler()
             custom = self.model_state.custom_sampler(self.sampler)
 
             if custom:
                 self.sampler, self.rejection_sampler = custom
             elif self.speculative_config is not None:
-                self.rejection_sampler = RejectionSampler(
-                    self.sampler,
-                    self.speculative_config,
-                    self.device,
-                )
-            self.prompt_logprobs_worker = PromptLogprobsWorker(
-                self.max_num_reqs,
-                logprobs_mode=self.model_config.logprobs_mode,
-            )
-            self.structured_outputs_worker = StructuredOutputsWorker(
-                max_num_logits=self.max_num_reqs * self.decode_query_len,
-                vocab_size=self.vocab_size,
-                device=self.device,
-            )
+                self.rejection_sampler = self.init_rejection_sampler(self.sampler)
+            self.prompt_logprobs_worker = self.init_prompt_logprobs_worker(self.sampler)
+            self.structured_outputs_worker = self.init_structured_outputs_worker()
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model)
@@ -934,7 +915,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
 
             max_expand_len = self.decode_query_len
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+            expanded_idx_mapping, expanded_local_pos = self.expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, max_expand_len
             )
 
@@ -957,7 +938,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get prefill tokens if any.
         if np.any(is_prefilling_np):
-            prepare_prefill_inputs(
+            self.prepare_prefill_inputs(
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
                 idx_mapping,
@@ -968,7 +949,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Prepare positions and seq_lens.
-        prepare_pos_seq_lens(
+        self.prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
             self.req_states.num_computed_tokens.gpu,
@@ -992,7 +973,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
+        logits_indices = self.combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
             self.req_states.last_sampled_tokens,
@@ -1137,7 +1118,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
         else:
             output_bin_counts = None
-        post_update(
+        self.post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
             self.req_states.last_sampled_tokens,
@@ -1362,6 +1343,145 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors
         return None
+
+    # --- Components an out-of-tree hardware runner replaces: each holds the
+    # kernels of its stage, so a platform without Triton subclasses the
+    # component and implements them. ---
+
+    def init_sampler(self) -> Sampler:
+        return Sampler(
+            max_num_reqs=self.max_num_reqs,
+            vocab_size=self.vocab_size,
+            device=self.device,
+            req_states=self.req_states,
+            logprobs_mode=self.model_config.logprobs_mode,
+            num_speculative_tokens=self.decode_query_len,
+            use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+        )
+
+    def init_rejection_sampler(self, sampler: Sampler) -> RejectionSampler:
+        assert self.speculative_config is not None
+        return RejectionSampler(sampler, self.speculative_config, self.device)
+
+    def init_prompt_logprobs_worker(self, sampler: Sampler) -> PromptLogprobsWorker:
+        return PromptLogprobsWorker(
+            self.max_num_reqs, sampler, logprobs_mode=self.model_config.logprobs_mode
+        )
+
+    def init_structured_outputs_worker(self) -> StructuredOutputsWorker:
+        return StructuredOutputsWorker(
+            max_num_logits=self.max_num_reqs * self.decode_query_len,
+            vocab_size=self.vocab_size,
+            device=self.device,
+        )
+
+    # --- The runner's own kernels, over the request state and input buffers.
+    # A platform without Triton overrides these. ---
+
+    def prepare_prefill_inputs(
+        self,
+        input_ids: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        all_token_ids: torch.Tensor,
+        prefill_len: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+    ) -> None:
+        prepare_prefill_inputs(
+            input_ids,
+            next_prefill_tokens,
+            idx_mapping,
+            query_start_loc,
+            all_token_ids,
+            prefill_len,
+            num_computed_tokens,
+        )
+
+    def prepare_pos_seq_lens(
+        self,
+        idx_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        pos: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        prepare_pos_seq_lens(
+            idx_mapping, query_start_loc, num_computed_tokens, pos, seq_lens
+        )
+
+    def combine_sampled_and_draft_tokens(
+        self,
+        input_ids: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        last_sampled_tokens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prefill_len: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        cu_num_logits: torch.Tensor,
+        num_logits: int,
+        num_new_sampled_tokens: int,
+    ) -> torch.Tensor:
+        return combine_sampled_and_draft_tokens(
+            input_ids,
+            idx_mapping,
+            last_sampled_tokens,
+            query_start_loc,
+            seq_lens,
+            prefill_len,
+            draft_tokens,
+            cu_num_logits,
+            num_logits,
+            num_new_sampled_tokens,
+        )
+
+    def expand_idx_mapping(
+        self,
+        idx_mapping: torch.Tensor,
+        total_num_logits: int,
+        cu_num_logits: torch.Tensor,
+        max_expand_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return expand_idx_mapping(
+            idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+        )
+
+    def post_update(
+        self,
+        idx_mapping: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        last_sampled_tokens: torch.Tensor,
+        output_bin_counts: torch.Tensor | None,
+        sampled_tokens: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        query_start_loc: torch.Tensor | None,
+        all_token_ids: torch.Tensor,
+        total_len: torch.Tensor,
+    ) -> None:
+        post_update(
+            idx_mapping,
+            num_computed_tokens,
+            last_sampled_tokens,
+            output_bin_counts,
+            sampled_tokens,
+            num_sampled,
+            num_rejected,
+            query_start_loc,
+            all_token_ids,
+            total_len,
+        )
+
+    def post_update_num_computed_tokens(
+        self,
+        idx_mapping: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        post_update_num_computed_tokens(
+            idx_mapping, num_computed_tokens, query_start_loc
+        )
 
     def init_speculator(self) -> BaseSpeculator:
         """The drafter for the configured speculative method.
@@ -1668,7 +1788,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def postprocess_num_computed_tokens(self, input_batch: InputBatch) -> None:
         # Update the number of computed tokens.
-        post_update_num_computed_tokens(
+        self.post_update_num_computed_tokens(
             input_batch.idx_mapping,
             self.req_states.num_computed_tokens.gpu,
             input_batch.query_start_loc,

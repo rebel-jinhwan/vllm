@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
 
@@ -7,14 +9,18 @@ from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+
 MAX_NUM_ALLOWED_TOKEN_IDS = 1024
 MAX_NUM_LOGIT_BIAS_TOKENS = 1024
 MAX_NUM_STOP_TOKEN_IDS = 128
 
 
 class LogitBiasState:
-    def __init__(self, max_num_reqs: int, device: torch.device):
+    def __init__(self, max_num_reqs: int, device: torch.device, sampler: "Sampler"):
         self.max_num_reqs = max_num_reqs
+        self.sampler = sampler
 
         # Allowed token IDs.
         self.num_allowed_token_ids = UvaBackedTensor(
@@ -129,7 +135,7 @@ class LogitBiasState:
             # No request uses logit bias. Skip the kernel launch.
             return
 
-        apply_logit_bias(
+        self.sampler.apply_logit_bias(
             logits,
             expanded_idx_mapping,
             pos,
