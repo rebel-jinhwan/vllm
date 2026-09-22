@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
     async_tensor_h2d,
@@ -39,14 +39,15 @@ class UvaBuffer:
 
 
 class NonUvaBuffer:
-    """Explicit-copy fallback for platforms without pinned memory."""
+    """Explicit-copy fallback for platforms without UVA: the device reads a
+    mirror that every `uva()` call refreshes from the host tensor."""
 
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         from vllm.platforms import current_platform
 
         logger.warning_once(
-            "Pinned memory is not available on this platform; falling back "
-            "to device memory for UVA buffers."
+            "UVA is not available on this platform; falling back to device "
+            "mirrors for UVA buffers."
         )
         self.cpu = torch.zeros(size, dtype=dtype, device="cpu")
         self.np = self.cpu.numpy()
@@ -211,6 +212,26 @@ class StagedWriteTensor:
                 self._staged_write_contents
             )
 
+        if not HAS_TRITON:
+            # The kernel is a scatter of per-row segments; do it with indexing.
+            indices = indices_uva.to(self.gpu.device).long()
+            cu_lens = torch.cat([cu_lens_uva.new_zeros(1), cu_lens_uva]).long()
+            lens = cu_lens[1:] - cu_lens[:-1]
+            write = torch.repeat_interleave(
+                torch.arange(n, device=self.gpu.device), lens.to(self.gpu.device)
+            )
+            offset = (
+                torch.arange(int(cu_lens[-1]), device=self.gpu.device)
+                - (cu_lens[:-1].to(self.gpu.device)[write])
+            )
+            flat = (
+                indices[write] * self.gpu.stride(0)
+                + starts_uva.to(self.gpu.device).long()[write]
+                + offset
+            )
+            self.gpu.view(-1)[flat] = write_contents.to(self.gpu.dtype)
+            self.clear_staged_writes()
+            return
         # Write diffs to the GPU buffer
         _apply_write_kernel[(n,)](
             self.gpu,
@@ -255,6 +276,12 @@ class FusedStagedWriter:
         output_strides: torch.Tensor,
     ) -> None:
         """Apply and clear the staged writes of `tensors` with one kernel."""
+        if not HAS_TRITON:
+            # The fused kernel reaches each output through a raw pointer table,
+            # which only a Triton kernel can dereference.
+            for t in tensors:
+                t.apply_write()
+            return
         group_ids: list[int] = []
         indices: list[int] = []
         starts: list[int] = []

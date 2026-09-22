@@ -990,6 +990,14 @@ class Platform:
 
         return CpuArchEnum.OTHER if machine else CpuArchEnum.UNKNOWN
 
+    def supports_uva(self) -> bool:
+        """Whether a pinned host tensor can be mapped into the device address
+        space (Unified Virtual Addressing), so a kernel reads host memory in
+        place. Without it, host-side buffers keep an explicit device mirror."""
+        return (
+            self.is_cuda_alike() or self.is_xpu()
+        ) and self.is_pin_memory_available()
+
     @classmethod
     def is_pin_memory_available(cls) -> bool:
         """Checks whether pin memory is available on the current platform."""
