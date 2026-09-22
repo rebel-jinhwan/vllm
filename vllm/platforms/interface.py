@@ -1139,6 +1139,18 @@ class Platform:
         return "vllm.compilation.base_static_graph.AbstractStaticGraphWrapper"
 
     @classmethod
+    def has_v2_model_runner_kernels(cls) -> bool:
+        """Whether the V2 model runner's request-state, input-preparation and
+        sampling kernels (vllm/v1/worker/gpu/) can run on this platform.
+
+        They are Triton kernels, so the default answer is whether Triton is
+        usable. A platform that supplies its own implementations of them
+        returns True."""
+        from vllm.triton_utils import HAS_TRITON
+
+        return HAS_TRITON
+
+    @classmethod
     def stateless_init_device_torch_dist_pg(
         cls,
         backend: str,
