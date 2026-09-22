@@ -10,6 +10,51 @@ This document proposes how a non-CUDA platform plugs into MRV2 without copying o
 
 The design is written from scratch. It does not describe the current code, although a partial implementation exists and is referenced at the end.
 
+## Motivation: what out-of-tree platforms do today
+
+Every platform that runs vLLM's worker off CUDA has solved the same problem alone, and the solutions look alike. The table is read from the repositories at the commits named; the quotes are the maintainers' own words. File references are `path@commit:line`.
+
+| Platform | Runner | How it adapts upstream |
+| --- | --- | --- |
+| vllm-ascend `86ac840b` | V1: `NPUModelRunner(GPUModelRunner)`, 6,258 lines. V2: subclass, 953 lines, next to a parallel `worker/v2/{sample,spec_decode}/` tree that re-implements the sampler and every speculator. | 60 patch modules (13 for V2) with a 1,564-line catalogue (`vllm_ascend/patch/__init__.py`). `torch.cuda.*` aliased to `torch.npu.*`, 12 attributes, `finally: pass` (`worker/v2/utils.py@86ac840b:17-37`). |
+| vllm-gaudi `e487250` | `HPUModelRunner`, 7,907 lines, no `GPUModelRunner` base; methods marked "Copied from vllm/v1/worker/gpu_model_runner.py" (`hpu_model_runner.py:3952`). | 11 catalogued runtime patches, each pinned to the upstream PR that forced it (`vllm_gaudi/patches.py`). README: "upstream API updates may introduce compatibility issues." |
+| vllm-neuron `f8abae6` | `NeuronModelRunner`, 9,086 lines; `_update_states` is "copied VERBATIM from upstream ... DO NOT modify it directly" (`neuron_model_runner.py:1908-1910`). | Patches applied at import time "so they survive spawn-mode re-imports"; one release branch per vLLM version. |
+| tpu-inference `7bb0af8` | JAX runner, 3,455 lines plus managers; own sampler and speculators. | `torch.accelerator.empty_cache / get_memory_info / synchronize` monkeypatched at module level. The one GPU class it reuses, it subclasses "and override[s] only the two device-bound methods, inheriting everything algorithmic" (`runner/mm_encoder_jit_manager.py:8-16`). |
+| Spyre (`sendnn-inference` `f488d54`) | From scratch, 2,062 lines. | `del sys.modules["triton"]`, a stream placeholder, `vllm>=0.26.0,<0.27.2`. |
+| vllm-mlu `dc984838` (V1 only) | `MLUModelRunner(GPUModelRunner)`, 4,166 lines; overrides `execute_model`, `sample_tokens`, `propose_draft_token_ids`. | 125 `apply_hijack` `setattr` calls across 45 modules. |
+| vllm-metax `17c4cc4b` | CUDA-like device; runner untouched except one method. | 41 patch files with a dated per-patch audit (`vllm_metax/patch/AUDIT.md`). |
+| in-tree XPU and CPU `ff3c9cb` | Both subclass `GPUModelRunner`. | XPU rebinds `torch.cuda.Stream / Event / graph / CUDAGraph` to `torch.xpu.*` around `super().__init__()` (`xpu_model_runner.py:43-63`). CPU installs `_StreamPlaceholder` / `_EventPlaceholder` and rebinds kernel objects to C++ (`cpu_model_runner.py:65-110`). |
+
+Eight patterns recur. Each one names the principle or seam below that answers it.
+
+1. **There is no runner-level extension point, so every platform owns a runner.** `docs/design/plugin_system.md` offers `worker_cls` and nothing below it; `gpu_worker.py@ff3c9cb:146-147` hard-codes the runner import; the only seam MRV2 has today is `pcp_manager_cls` (`gpu/model_runner.py:2304-2306`). [RFC #51212](https://github.com/vllm-project/vllm/issues/51212): "in practice each backend ends up copying the entire GPU model runner and maintaining it independently ... ~8000 lines." Answered by principles 1 to 3 and the execution seams.
+
+2. **Subclassing is defeated by upstream call sites, not by upstream classes.** vllm-ascend patches `InputBatch` because "vllm use InputBatch to make dummy tensors. in `model_runner.py` and `cudagraph_utils.py` which make it difficult to inherit from vllm methods" (`patch/__init__.py@86ac840b:1319-1320`), and `BlockTables`, `init_model_state` and `get_kv_cache_spec` for the same reason. RFC #51212: "The runner creates internal components ... by directly instantiating GPU-specific classes. A backend that needs its own version has to `del` the GPU object and recreate it in `__init__`." Two Ascend patches ask, word for word, for "a backend-dispatchable spec-decode graph manager abstraction" (`:1300-1313`). Answered by principle 3 and I3: `init_*` factories; and by seaming the decision and the execution instead of the graph manager.
+
+3. **Triton is the largest single source of replacement, and it is replaced by module attribute.** `patch/worker/patch_v2/patch_triton.py@86ac840b:41-76` rebinds 18 symbols, `gumbel_sample` in five modules and `compute_topk_logprobs` in three, "because sampler.py and speculator.py are imported before this patch, they must be overridden" (`:42`); the catalogue's reason is "there is no dispatch mechanism for triton ops" (`:1355-1368`). In-tree CPU does the same to kernel objects. [RFC #45133](https://github.com/vllm-project/vllm/issues/45133) counts 55 rewritten kernels; a Kunlun maintainer: "the Triton code in v2 is blocking this process"; a Tenstorrent maintainer: "What non-GPU backends need is a Torch-native `rejection_sample` reference plus a class-level seam, not per-platform Triton variants." Answered by the kernel interface, I1 and I2.
+
+4. **The V2 gate itself gets taken over.** vllm-ascend replaces four `VllmConfig` members, `use_v2_model_runner`, `_validate_v2_model_runner` and both unsupported-feature lists, because upstream enables V2 by "model architecture whitelists, Triton availability, and feature compatibility checks" that do not describe the device (`patch/platform/patch_use_v2_model_runner.py@86ac840b:50-71`). Answered by `has_v2_model_runner_kernels()` and principle 4.
+
+5. **Streams, events and `torch.accelerator` are aliased, never abstracted.** Ascend does it twice, in-tree XPU does it, in-tree CPU installs placeholders, Gaudi, TPU and Spyre each patch `torch.accelerator.empty_cache`, Neuron fakes `torch.neuron.current_stream` "to prevent CUDA fallthrough". The checklist to route these through the platform ([RFC #9268](https://github.com/vllm-project/vllm/issues/9268), 2024) is still unchecked; the follow-up ([RFC #20708](https://github.com/vllm-project/vllm/issues/20708)) closed with its PR unmerged. Answered by principle 5: torch's generic API, which needs no routing.
+
+6. **UVA has one implementation and no fallback.** vllm-ascend's own RFC to delete its 171-line `UvaBuffer` replacement ([#14209](https://github.com/vllm-project/vllm-ascend/issues/14209)): "The upstream implementation only supports CUDA/XPU accelerator views and has no device-independent fallback"; acceptance criterion: "No vLLM `UvaBuffer` symbol is replaced." Answered by `supports_uva()` and the `NonUvaBuffer` path.
+
+7. **Pipeline parallelism is where plugins fight upstream for state ownership.** vllm-ascend bypasses the Spec+PP guard by setting `pipeline_parallel_size = 1` around `super().__init__()`, restores it afterwards, and binds replacement broadcast methods onto the live `PPHandler` instance (`worker/v2/pp_utils.py@86ac840b:94-125`, `patch/worker/patch_v2/patch_spec_pp.py:44-48`). Its [RFC #14179](https://github.com/vllm-project/vllm-ascend/issues/14179) asks to "migrate PP speculative-decoding state ownership upstream." Answered by keeping PP explicitly CUDA and giving the platform a factory to refuse it (I7).
+
+8. **The breakage cadence is stated by the people who pay for it.** vllm-ascend: "CI breaks once a week on average" ([RFC #22082](https://github.com/vllm-project/vllm/issues/22082)); "More and more env, additional config and patch are added to vLLM Ascend. It makes vLLM Ascend hard to be used and maintained" ([#5304](https://github.com/vllm-project/vllm-ascend/issues/5304)). vllm-metax's audit found one of its own patches "reintroduced that obsolete behavior" after upstream had fixed it correctly. Answered by I8, verbatim moves with CUDA CI as the regression test, and by keeping the seam count small enough to list in one table.
+
+### Relationship to open upstream proposals
+
+[RFC #51212](https://github.com/vllm-project/vllm/issues/51212) proposes three layers: a Triton kernel dispatcher (RFC #45133, PR #43048), `Platform` factory methods for replaceable parts (PR #53895), and per-step runner hooks, the last marked "Not planned since this is much hack". A core maintainer's review: "very reasonable with the exception of layer 3; I fear this will be too invasive for the GPU model runner and will likely be hard to standardize as new features will continually adjust the hook signatures and placements."
+
+This design accepts that objection and answers each layer differently:
+
+- **Kernels through one typed class, not a name-keyed dispatcher.** `ModelRunnerKernels` makes completeness a static property (I2) and a renamed kernel a startup failure. It is the shape the Tenstorrent comment on #45133 asks for.
+- **Factories on the runner, not a component bundle on `Platform`.** The runner is the one place that constructs (I3), so adding a component means adding one method there, and `Platform` never imports worker code.
+- **Three execution seams whose names are decisions, not a list of hooks.** `dispatch_batch`, `build_attn_metadata` and `run_model` are where a "what" becomes a "how". A new feature changes a seam's default body, which is a verbatim move of the code it replaces, not the seam's signature or placement.
+
+The earlier attempts at a device-agnostic runner ([#9268](https://github.com/vllm-project/vllm/issues/9268), [#11162](https://github.com/vllm-project/vllm/issues/11162), [#12992](https://github.com/vllm-project/vllm/issues/12992), [#20708](https://github.com/vllm-project/vllm/issues/20708), [#22082](https://github.com/vllm-project/vllm/issues/22082)) all closed without landing the runner part. They were scoped as rewrites. This one is scoped as moves.
+
 ## Goals and non-goals
 
 Goals:
@@ -311,9 +356,10 @@ Out of tree, the platform is expected to run:
 
 | Alternative | Why not |
 | --- | --- |
-| Kernel registry keyed by qualified name, consulted by a placeholder `@triton.jit` object at launch | Stringly typed; no completeness check; a renamed kernel fails at runtime in a step. |
+| Kernel registry keyed by qualified name, consulted by a placeholder `@triton.jit` object at launch (the dispatcher of RFC #45133 / PR #43048) | Stringly typed; no completeness check; a renamed kernel fails at runtime in a step. |
 | One factory and one subclass per component (`init_sampler`, `init_rejection_sampler`, …) with kernel methods on each class | Five factories and five subclasses for what is one object; the platform reimplements the same delegation five times; upstream cannot add a component without adding a factory. |
-| `Platform.get_model_runner_kernels()` instead of `init_kernels()` on the runner | Moves a runner concern onto `Platform`, which then imports worker code; the runner is where the other device decisions already live. |
+| A `Platform`-provided component bundle (RFC #51212 layer 2, PR #53895) or `Platform.get_model_runner_kernels()` instead of factories on the runner | Moves a runner concern onto `Platform`, which then imports worker code; the bundle must grow for every new component; the runner is where the other device decisions already live. |
+| Per-step hooks in `execute_model` (RFC #51212 layer 3) | Hook signatures and placements move with every feature, as the upstream review of that RFC says; three seams named after decisions do not. |
 | Platform subclass of `GPUModelRunner` that copies `execute_model` | The state of the art before this design: a 1,300-line copy that drifts on every upstream change. |
 | `torch.cuda.*` aliased to the platform's namespace process-wide | Works until a genuine CUDA feature (graph capture) is reached, then fails obscurely; hides which code is device-neutral. |
 

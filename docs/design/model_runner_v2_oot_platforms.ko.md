@@ -10,6 +10,51 @@ English version: [model_runner_v2_oot_platforms.md](model_runner_v2_oot_platform
 
 이 설계는 백지에서 쓴 것이다. 현재 코드를 기술하는 문서가 아니며, 부분 구현이 존재한다는 사실은 마지막에 참고로만 언급한다.
 
+## 동기: out-of-tree 플랫폼들이 오늘 하고 있는 일
+
+CUDA 밖에서 vLLM worker를 돌리는 플랫폼은 모두 같은 문제를 각자 풀었고, 그 해법은 서로 닮았다. 아래 표는 명시한 커밋의 저장소를 직접 읽은 것이고, 인용은 유지자 본인의 말이다. 파일 참조는 `path@commit:line` 형식이다.
+
+| 플랫폼 | Runner | 업스트림을 어떻게 맞추는가 |
+| --- | --- | --- |
+| vllm-ascend `86ac840b` | V1: `NPUModelRunner(GPUModelRunner)`, 6,258줄. V2: subclass 953줄에 더해, sampler와 모든 speculator를 다시 구현한 병렬 트리 `worker/v2/{sample,spec_decode}/`. | patch 모듈 60개(V2용 13개)와 1,564줄짜리 카탈로그(`vllm_ascend/patch/__init__.py`). `torch.cuda.*` 12개 속성을 `torch.npu.*`로 프로세스 전역 alias, `finally: pass`(`worker/v2/utils.py@86ac840b:17-37`). |
+| vllm-gaudi `e487250` | `HPUModelRunner` 7,907줄, `GPUModelRunner`를 상속하지 않음. "Copied from vllm/v1/worker/gpu_model_runner.py"로 표시된 메서드들(`hpu_model_runner.py:3952`). | 카탈로그된 런타임 patch 11개, 각각 그것을 강제한 업스트림 PR에 고정(`vllm_gaudi/patches.py`). README: "upstream API updates may introduce compatibility issues." |
+| vllm-neuron `f8abae6` | `NeuronModelRunner` 9,086줄. `_update_states`는 "copied VERBATIM from upstream ... DO NOT modify it directly"(`neuron_model_runner.py:1908-1910`). | patch를 import 시점에 적용, "so they survive spawn-mode re-imports". vLLM 버전마다 release 브랜치 하나. |
+| tpu-inference `7bb0af8` | JAX runner 3,455줄과 manager들. 자체 sampler와 speculator. | `torch.accelerator.empty_cache / get_memory_info / synchronize`를 모듈 수준에서 monkeypatch. 유일하게 재사용하는 GPU 클래스는 subclass해서 "override only the two device-bound methods, inheriting everything algorithmic"(`runner/mm_encoder_jit_manager.py:8-16`). |
+| Spyre(`sendnn-inference` `f488d54`) | 백지에서 작성, 2,062줄. | `del sys.modules["triton"]`, stream placeholder, `vllm>=0.26.0,<0.27.2`. |
+| vllm-mlu `dc984838`(V1만) | `MLUModelRunner(GPUModelRunner)` 4,166줄. `execute_model`, `sample_tokens`, `propose_draft_token_ids`를 override. | 45개 모듈에 걸친 `apply_hijack` `setattr` 호출 125개. |
+| vllm-metax `17c4cc4b` | CUDA 계열 디바이스. runner는 메서드 하나 외에 건드리지 않음. | patch 파일 41개와 날짜가 찍힌 patch별 감사 문서(`vllm_metax/patch/AUDIT.md`). |
+| in-tree XPU, CPU `ff3c9cb` | 둘 다 `GPUModelRunner`를 subclass. | XPU는 `super().__init__()` 주위에서 `torch.cuda.Stream / Event / graph / CUDAGraph`를 `torch.xpu.*`로 재바인딩(`xpu_model_runner.py:43-63`). CPU는 `_StreamPlaceholder` / `_EventPlaceholder`를 설치하고 커널 객체를 C++로 재바인딩(`cpu_model_runner.py:65-110`). |
+
+여덟 가지 패턴이 반복된다. 각 항목은 그것에 답하는 아래의 원칙이나 seam을 가리킨다.
+
+1. **runner 수준의 확장점이 없어서 모든 플랫폼이 runner를 통째로 소유한다.** `docs/design/plugin_system.md`는 `worker_cls`만 제공하고 그 아래는 없다. `gpu_worker.py@ff3c9cb:146-147`은 runner import를 하드코딩한다. MRV2가 오늘 가진 유일한 seam은 `pcp_manager_cls`다(`gpu/model_runner.py:2304-2306`). [RFC #51212](https://github.com/vllm-project/vllm/issues/51212): "in practice each backend ends up copying the entire GPU model runner and maintaining it independently ... ~8000 lines." 원칙 1~3과 실행 seam이 답한다.
+
+2. **subclass를 무력화하는 것은 업스트림 클래스가 아니라 업스트림 호출 지점이다.** vllm-ascend는 `InputBatch`를 patch하는데 이유는 "vllm use InputBatch to make dummy tensors. in `model_runner.py` and `cudagraph_utils.py` which make it difficult to inherit from vllm methods"(`patch/__init__.py@86ac840b:1319-1320`)이고, `BlockTables`, `init_model_state`, `get_kv_cache_spec`도 같은 이유로 patch한다. RFC #51212: "The runner creates internal components ... by directly instantiating GPU-specific classes. A backend that needs its own version has to `del` the GPU object and recreate it in `__init__`." Ascend의 patch 두 개는 글자 그대로 "a backend-dispatchable spec-decode graph manager abstraction"을 요청한다(`:1300-1313`). 원칙 3과 I3의 `init_*` factory, 그리고 graph manager 대신 결정과 실행에 seam을 두는 것이 답한다.
+
+3. **Triton이 가장 큰 단일 대체 원인이고, 모듈 속성 대입으로 대체된다.** `patch/worker/patch_v2/patch_triton.py@86ac840b:41-76`은 심볼 18개를 재바인딩하는데, `gumbel_sample`은 모듈 다섯 곳, `compute_topk_logprobs`는 세 곳에서 그렇게 한다. "because sampler.py and speculator.py are imported before this patch, they must be overridden"(`:42`). 카탈로그의 이유는 "there is no dispatch mechanism for triton ops"(`:1355-1368`)다. in-tree CPU도 커널 객체에 같은 일을 한다. [RFC #45133](https://github.com/vllm-project/vllm/issues/45133)은 다시 쓴 커널을 55개로 센다. Kunlun 유지자: "the Triton code in v2 is blocking this process." Tenstorrent 유지자: "What non-GPU backends need is a Torch-native `rejection_sample` reference plus a class-level seam, not per-platform Triton variants." 커널 인터페이스와 I1, I2가 답한다.
+
+4. **V2 게이트 자체를 가져간다.** vllm-ascend는 `VllmConfig`의 멤버 넷, 즉 `use_v2_model_runner`, `_validate_v2_model_runner`, 그리고 미지원 기능 목록 둘을 대체한다. 업스트림이 V2를 켜는 기준이 "model architecture whitelists, Triton availability, and feature compatibility checks"라서 디바이스를 설명하지 못하기 때문이다(`patch/platform/patch_use_v2_model_runner.py@86ac840b:50-71`). `has_v2_model_runner_kernels()`와 원칙 4가 답한다.
+
+5. **stream, event, `torch.accelerator`는 추상화되지 않고 alias된다.** Ascend는 두 번, in-tree XPU도 하고, in-tree CPU는 placeholder를 설치하고, Gaudi, TPU, Spyre는 각자 `torch.accelerator.empty_cache`를 patch하고, Neuron은 "to prevent CUDA fallthrough"를 위해 `torch.neuron.current_stream`을 가짜로 만든다. 이것들을 플랫폼으로 라우팅하자는 체크리스트([RFC #9268](https://github.com/vllm-project/vllm/issues/9268), 2024)는 아직 체크되지 않았고, 후속([RFC #20708](https://github.com/vllm-project/vllm/issues/20708))은 PR이 merge되지 않은 채 닫혔다. 원칙 5, 즉 라우팅이 필요 없는 torch의 일반 API가 답한다.
+
+6. **UVA는 구현이 하나뿐이고 fallback이 없다.** vllm-ascend가 자기 171줄짜리 `UvaBuffer` 대체물을 지우자고 낸 RFC([#14209](https://github.com/vllm-project/vllm-ascend/issues/14209)): "The upstream implementation only supports CUDA/XPU accelerator views and has no device-independent fallback." 수용 기준: "No vLLM `UvaBuffer` symbol is replaced." `supports_uva()`와 `NonUvaBuffer` 경로가 답한다.
+
+7. **pipeline parallelism은 플랫폼이 상태 소유권을 두고 업스트림과 싸우는 곳이다.** vllm-ascend는 `super().__init__()` 주위에서 `pipeline_parallel_size = 1`로 바꿔 Spec+PP guard를 우회하고, 끝나면 되돌리고, 살아 있는 `PPHandler` 인스턴스에 대체 broadcast 메서드를 바인딩한다(`worker/v2/pp_utils.py@86ac840b:94-125`, `patch/worker/patch_v2/patch_spec_pp.py:44-48`). 그들의 [RFC #14179](https://github.com/vllm-project/vllm-ascend/issues/14179)는 "migrate PP speculative-decoding state ownership upstream"을 요청한다. PP를 명시적으로 CUDA로 남기고 플랫폼에 거부할 factory를 주는 것(I7)이 답한다.
+
+8. **파손 빈도는 그 비용을 내는 사람들이 직접 말한다.** vllm-ascend: "CI breaks once a week on average"([RFC #22082](https://github.com/vllm-project/vllm/issues/22082)). "More and more env, additional config and patch are added to vLLM Ascend. It makes vLLM Ascend hard to be used and maintained"([#5304](https://github.com/vllm-project/vllm-ascend/issues/5304)). vllm-metax의 감사는 자기 patch 하나가 업스트림이 올바르게 고친 뒤에도 "reintroduced that obsolete behavior"했음을 찾아냈다. I8, 즉 CUDA CI를 회귀 테스트로 삼는 verbatim 이동과, 표 하나에 다 들어갈 만큼 seam 수를 작게 유지하는 것이 답한다.
+
+### 열려 있는 업스트림 제안과의 관계
+
+[RFC #51212](https://github.com/vllm-project/vllm/issues/51212)는 세 층을 제안한다. Triton 커널 dispatcher(RFC #45133, PR #43048), 교체 가능한 부품을 위한 `Platform` factory 메서드(PR #53895), 그리고 스텝별 runner hook인데 마지막은 "Not planned since this is much hack"으로 표시되어 있다. 코어 유지자의 리뷰: "very reasonable with the exception of layer 3; I fear this will be too invasive for the GPU model runner and will likely be hard to standardize as new features will continually adjust the hook signatures and placements."
+
+이 설계는 그 반론을 받아들이고 각 층에 다르게 답한다.
+
+- **이름을 key로 하는 dispatcher가 아니라, 타입이 있는 클래스 하나로 커널을 다룬다.** `ModelRunnerKernels`는 완전성을 정적 성질로 만들고(I2), 이름이 바뀐 커널을 시작 시점 실패로 만든다. #45133의 Tenstorrent 코멘트가 요청한 바로 그 형태다.
+- **`Platform`의 부품 묶음이 아니라 runner의 factory.** runner가 생성하는 유일한 곳이므로(I3) 컴포넌트를 추가하는 일은 거기에 메서드 하나를 더하는 것이고, `Platform`은 worker 코드를 import하지 않는다.
+- **hook 목록이 아니라, 이름이 결정인 실행 seam 세 개.** `dispatch_batch`, `build_attn_metadata`, `run_model`은 "무엇"이 "어떻게"로 바뀌는 지점이다. 새 기능은 seam의 기본 본문을 바꾸는데, 그 본문은 대체한 코드를 그대로 옮긴 것이므로 seam의 시그니처나 위치는 바뀌지 않는다.
+
+디바이스 중립 runner를 향한 이전 시도들([#9268](https://github.com/vllm-project/vllm/issues/9268), [#11162](https://github.com/vllm-project/vllm/issues/11162), [#12992](https://github.com/vllm-project/vllm/issues/12992), [#20708](https://github.com/vllm-project/vllm/issues/20708), [#22082](https://github.com/vllm-project/vllm/issues/22082))은 모두 runner 부분을 landing하지 못하고 닫혔다. 그것들은 다시 쓰기로 범위를 잡았다. 이 제안은 옮기기로 범위를 잡는다.
+
 ## 목표와 비목표
 
 목표:
@@ -311,9 +356,10 @@ out of tree에서 플랫폼은 다음을 실행할 것으로 기대한다.
 
 | 대안 | 채택하지 않은 이유 |
 | --- | --- |
-| qualified name을 key로 하는 커널 registry를 placeholder `@triton.jit` 객체가 실행 시점에 조회 | 문자열 기반이다. 완전성 검사가 없다. 커널 이름이 바뀌면 스텝 도중 런타임에 실패한다. |
+| qualified name을 key로 하는 커널 registry를 placeholder `@triton.jit` 객체가 실행 시점에 조회(RFC #45133 / PR #43048의 dispatcher) | 문자열 기반이다. 완전성 검사가 없다. 커널 이름이 바뀌면 스텝 도중 런타임에 실패한다. |
 | 컴포넌트마다 factory와 subclass 하나씩(`init_sampler`, `init_rejection_sampler`, …), 각 클래스에 커널 메서드 | 객체 하나면 될 것에 factory 다섯 개와 subclass 다섯 개. 플랫폼은 같은 위임을 다섯 번 다시 구현한다. 업스트림은 factory를 추가하지 않고는 컴포넌트를 추가할 수 없다. |
-| runner의 `init_kernels()` 대신 `Platform.get_model_runner_kernels()` | runner의 관심사를 `Platform`으로 옮기고, `Platform`이 worker 코드를 import하게 된다. 다른 디바이스 결정은 이미 runner에 있다. |
+| runner의 factory 대신 `Platform`이 제공하는 부품 묶음(RFC #51212의 2층, PR #53895)이나 `Platform.get_model_runner_kernels()` | runner의 관심사를 `Platform`으로 옮기고, `Platform`이 worker 코드를 import하게 된다. 묶음은 새 컴포넌트마다 커져야 한다. 다른 디바이스 결정은 이미 runner에 있다. |
+| `execute_model` 안의 스텝별 hook(RFC #51212의 3층) | 그 RFC에 대한 업스트림 리뷰가 말하듯 hook의 시그니처와 위치는 기능마다 움직인다. 결정의 이름을 가진 seam 세 개는 그렇지 않다. |
 | `execute_model`을 복사한 `GPUModelRunner`의 플랫폼 subclass | 이 설계 이전의 현실. 업스트림이 바뀔 때마다 어긋나는 1,300줄짜리 복사본. |
 | `torch.cuda.*`를 프로세스 전체에서 플랫폼 namespace로 alias | 진짜 CUDA 기능(graph capture)에 닿기 전까지는 동작하다가 알아보기 어렵게 실패한다. 어느 코드가 디바이스 중립인지 숨긴다. |
 
