@@ -199,6 +199,33 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
 
+    def dispatch_batch(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        *,
+        decode: bool,
+        need_eager: bool,
+        dp_sync: DPSyncState | None,
+    ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+        """Decide the shape a draft pass runs at, agreed across DP ranks: the
+        first pass over the target's tokens (`decode=False`) or one of the
+        one-token-per-request passes after it (`decode=True`).
+
+        Out-of-tree hardware speculators override this to pick from the
+        shapes they compiled and to run their own DP agreement."""
+        return dispatch_cg_and_sync_dp(
+            self.decode_cudagraph_manager if decode else self.prefill_cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            need_eager=need_eager,
+            dp_sync=dp_sync,
+        )
+
     @torch.inference_mode()
     def propose(
         self,
@@ -291,13 +318,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             max_query_len,
             input_batch.has_prefill,
         )
-        prefill_batch_desc, prefill_batch_sync = dispatch_cg_and_sync_dp(
-            self.prefill_cudagraph_manager,
+        prefill_batch_desc, prefill_batch_sync = self.dispatch_batch(
             num_reqs,
             num_tokens_padded,
             uniform_token_count,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
+            decode=False,
             need_eager=is_profile,
             dp_sync=dp_sync,
         )
@@ -357,13 +382,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
         # Each request produces exactly 1 token per draft generation step,
         # enabling FULL graph replay.
-        decode_batch_desc, decode_batch_sync = dispatch_cg_and_sync_dp(
-            self.decode_cudagraph_manager,
+        decode_batch_desc, decode_batch_sync = self.dispatch_batch(
             num_reqs,
             num_batch_tokens,
-            uniform_token_count=1,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
+            1,
+            decode=True,
             need_eager=is_profile,
             dp_sync=decode_batch_sync,
         )
