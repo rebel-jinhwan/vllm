@@ -19,14 +19,20 @@ from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.kernels import ModelRunnerKernels
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 logger = init_logger(__name__)
 
 
 class MultiModuleMTPSpeculator(DraftModelSpeculator):
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        kernels: ModelRunnerKernels,
+    ):
+        super().__init__(vllm_config, device, kernels)
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device

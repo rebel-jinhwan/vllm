@@ -971,8 +971,10 @@ class DiffusionSampler:
         tp_size: int = 1,
         tp_group_name: str = "",
     ):
+        self.sampler = sampler
         self.sampling_states = sampler.sampling_states
         self.logprob_token_ids_state = sampler.logprob_token_ids_state
+        self.kernels = sampler.kernels
         self.req_states = sampler.req_states
         self.logits_mode = sampler.logprobs_mode in ("raw_logits", "processed_logits")
         # Self-conditioning soft embed = probs @ embed_weight * normalizer,
@@ -1300,6 +1302,7 @@ class DiffusionSampler:
                         pos = li * CL
                         per_req_ids = max_token_ids > 0
                         self._pending_logprobs[slot.item()] = compute_topk_scores(
+                            self.kernels,
                             flat_logits[pos : pos + k_i],
                             num_logprobs,
                             argmax_tokens[local_idx][:k_i],

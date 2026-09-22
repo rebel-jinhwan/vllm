@@ -3,10 +3,11 @@
 import numpy as np
 import torch
 
-from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
+from vllm.v1.worker.gpu.async_utils import stream
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
 
 def _build_grammar_mapping(
@@ -43,7 +44,9 @@ class StructuredOutputsWorker:
         device: torch.device,
         mask_stride: int,
         num_bonus_tokens: int,
+        kernels: ModelRunnerKernels,
     ):
+        self.kernels = kernels
         self.logits_indices = torch.zeros(
             max_num_logits, dtype=torch.int32, device=device
         )
@@ -51,7 +54,7 @@ class StructuredOutputsWorker:
             (max_num_logits, cdiv(vocab_size, 32)), dtype=torch.int32, device=device
         )
         self.device = device
-        self.copy_stream = torch.cuda.Stream()
+        self.copy_stream = torch.Stream(device=device)
         self.mask_stride = mask_stride
         self.num_bonus_tokens = num_bonus_tokens
 
@@ -66,7 +69,8 @@ class StructuredOutputsWorker:
             return
 
         # Asynchronously copy the bitmask to GPU.
-        with torch.cuda.stream(self.copy_stream):
+        current_stream = torch.accelerator.current_stream(self.device)
+        with stream(self.copy_stream, current_stream):
             bitmask = async_tensor_h2d(
                 grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
             )
@@ -85,7 +89,7 @@ class StructuredOutputsWorker:
         )
 
         # Asynchronously copy the mapping to GPU.
-        with torch.cuda.stream(self.copy_stream):
+        with stream(self.copy_stream, current_stream):
             logits_indices = torch.tensor(
                 mapping, dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
             )
@@ -94,69 +98,13 @@ class StructuredOutputsWorker:
             )
 
         # Ensure all async copies are complete before launching the kernel.
-        current_stream = torch.cuda.current_stream()
         current_stream.wait_stream(self.copy_stream)
 
-        num_masks = bitmask.shape[0]
-        assert num_masks == len(mapping)
-        vocab_size = logits.shape[-1]
-        BLOCK_SIZE = 8192
-        grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
-        _apply_grammar_bitmask_kernel[grid](
-            logits,
-            logits.stride(0),
-            logits_indices,
-            input_batch.cu_num_logits,
-            bitmask,
-            bitmask.stride(0),
-            vocab_size,
-            MASK_STRIDE=self.mask_stride,
-            BLOCK_SIZE=BLOCK_SIZE,
+        assert bitmask.shape[0] == len(mapping)
+        self.kernels.apply_grammar_bitmask(
+            logits, logits_indices, input_batch.cu_num_logits, bitmask, self.mask_stride
         )
 
         # Ensure the copy stream waits for the device tensors to finish being used
         # before it re-uses or deallocates them
         self.copy_stream.wait_stream(current_stream)
-
-
-# Adapted from
-# https://github.com/mlc-ai/xgrammar/blob/main/python/xgrammar/kernels/apply_token_bitmask_inplace_triton.py
-@triton.jit
-def _apply_grammar_bitmask_kernel(
-    logits_ptr,
-    logits_stride,
-    logits_indices_ptr,
-    cu_num_logits_ptr,
-    bitmask_ptr,
-    bitmask_stride,
-    vocab_size,
-    MASK_STRIDE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    bitmask_idx = tl.program_id(0)
-    mapping_idx = tl.load(logits_indices_ptr + bitmask_idx)
-    req_idx = mapping_idx // MASK_STRIDE
-    position_idx = mapping_idx % MASK_STRIDE
-    logits_idx = tl.load(cu_num_logits_ptr + req_idx)
-    num_req_logits = tl.load(cu_num_logits_ptr + req_idx + 1) - logits_idx
-    logits_idx += position_idx
-    position_is_active = position_idx < num_req_logits
-
-    # Load the bitmask.
-    block_id = tl.program_id(1)
-    bitmask_offset = (block_id * BLOCK_SIZE) // 32 + tl.arange(0, BLOCK_SIZE // 32)
-    packed_bitmask = tl.load(
-        bitmask_ptr + bitmask_idx * bitmask_stride + bitmask_offset,
-        mask=bitmask_offset < bitmask_stride,
-    )
-    # Unpack the bitmask.
-    bitmask = ((packed_bitmask[:, None] >> (tl.arange(0, 32)[None, :])) & 1) == 0
-    bitmask = bitmask.reshape(BLOCK_SIZE)
-
-    # Apply the bitmask to the logits.
-    block_offset = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    tl.store(
-        logits_ptr + logits_idx * logits_stride + block_offset,
-        -float("inf"),
-        mask=position_is_active & bitmask & (block_offset < vocab_size),
-    )
