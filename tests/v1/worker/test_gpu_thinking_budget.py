@@ -15,6 +15,7 @@ if not torch.cuda.is_available():
     )
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.kernels import TritonKernels
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
@@ -205,6 +206,7 @@ def test_v2_greedy_sampling_applies_thinking_budget():
         vocab_size=VOCAB_SIZE,
         device=DEVICE,
         req_states=req_states,
+        kernels=TritonKernels(),
     )
     sampler.add_request(
         req_idx=3,

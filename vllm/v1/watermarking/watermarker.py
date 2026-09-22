@@ -7,7 +7,7 @@ from typing import Protocol, runtime_checkable
 
 import torch
 
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.kernels import gumbel_sample
 
 
 @dataclass(frozen=True)
