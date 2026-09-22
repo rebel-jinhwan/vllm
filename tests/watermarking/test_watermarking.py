@@ -950,9 +950,8 @@ def test_draft_sampler_uses_draft_key_and_advances_context(monkeypatch):
     draft_watermarker.contexts = torch.tensor([[1, 2], [3, 4]])
     draft_watermarker.enabled = torch.tensor([True, False])
     speculator.draft_watermarker = draft_watermarker
-    monkeypatch.setattr(
-        "vllm.v1.worker.gpu.spec_decode.speculator.gumbel_sample",
-        lambda *args, **kwargs: torch.tensor([3, 4]),
+    speculator.kernels = SimpleNamespace(
+        gumbel_sample=lambda *args, **kwargs: torch.tensor([3, 4])
     )
 
     sampled = speculator.sample_draft(

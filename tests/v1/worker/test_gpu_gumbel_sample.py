@@ -22,9 +22,9 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA required for Gumbel sampler tests", allow_module_level=True)
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.kernels import gumbel_sample
 from vllm.v1.worker.gpu.sample.gumbel import (
     _uniform64_from_random53,
-    gumbel_sample,
     murmur3_hash32,
 )
 

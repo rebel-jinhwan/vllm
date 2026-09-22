@@ -3,9 +3,12 @@
 import torch
 
 from vllm.config import VllmConfig
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
 
-def init_speculator(vllm_config: VllmConfig, device: torch.device):
+def init_speculator(
+    vllm_config: VllmConfig, device: torch.device, kernels: ModelRunnerKernels
+):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     if speculative_config.method == "extract_hidden_states":
@@ -13,46 +16,46 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
             ExtractHiddenStatesSpeculator,
         )
 
-        return ExtractHiddenStatesSpeculator(vllm_config, device)
+        return ExtractHiddenStatesSpeculator(vllm_config, device, kernels)
     elif speculative_config.method == "dflash":
         if "DFlash2DraftModel" in speculative_config.draft_model_config.architectures:
             from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
                 DFlash2Speculator,
             )
 
-            return DFlash2Speculator(vllm_config, device)
+            return DFlash2Speculator(vllm_config, device, kernels)
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
             DFlashSpeculator,
         )
 
-        return DFlashSpeculator(vllm_config, device)
+        return DFlashSpeculator(vllm_config, device, kernels)
     elif speculative_config.method == "dspark":
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
             DSparkSpeculator,
         )
 
-        return DSparkSpeculator(vllm_config, device)
+        return DSparkSpeculator(vllm_config, device, kernels)
     elif speculative_config.use_gemma4_mtp():
         from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
             Gemma4Speculator,
         )
 
-        return Gemma4Speculator(vllm_config, device)
+        return Gemma4Speculator(vllm_config, device, kernels)
     elif speculative_config.use_multi_module_mtp():
         from vllm.v1.worker.gpu.spec_decode.multi_module_mtp.speculator import (
             MultiModuleMTPSpeculator,
         )
 
-        return MultiModuleMTPSpeculator(vllm_config, device)
+        return MultiModuleMTPSpeculator(vllm_config, device, kernels)
     elif speculative_config.method == "mtp":
         from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 
-        return MTPSpeculator(vllm_config, device)
+        return MTPSpeculator(vllm_config, device, kernels)
     elif speculative_config.use_eagle():
         from vllm.v1.worker.gpu.spec_decode.eagle.speculator import (
             EagleSpeculator,
         )
 
-        return EagleSpeculator(vllm_config, device)
+        return EagleSpeculator(vllm_config, device, kernels)
     else:
         raise NotImplementedError(f"{speculative_config.method} is not supported yet.")

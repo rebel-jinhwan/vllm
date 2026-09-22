@@ -113,14 +113,9 @@ from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
-    combine_sampled_and_draft_tokens,
-    expand_idx_mapping,
-    post_update,
-    post_update_num_computed_tokens,
-    prepare_pos_seq_lens,
-    prepare_prefill_inputs,
     set_dummy_context,
 )
+from vllm.v1.worker.gpu.kernels import TritonKernels
 from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     KVConnector,
@@ -170,6 +165,7 @@ from vllm.v1.worker.gpu.ubatch_utils import (
     UBatchState,
     maybe_build_ubatch_runner,
 )
+from vllm.v1.worker.kernels import ModelRunnerKernels
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -201,6 +197,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.jit_warmup_registry = JitWarmupRegistry(vllm_config)
 
         self.device = device
+        self.kernels: ModelRunnerKernels = self.init_kernels()
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
@@ -449,6 +446,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "vocab_size": self.vocab_size,
                 "device": self.device,
                 "req_states": self.req_states,
+                "kernels": self.kernels,
                 "logprobs_mode": self.model_config.logprobs_mode,
                 "num_speculative_tokens": self.decode_query_len,
                 "use_fp64_gumbel": self.model_config.use_fp64_gumbel,
@@ -487,6 +485,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
+                self.kernels,
                 logprobs_mode=self.model_config.logprobs_mode,
             )
             self.structured_outputs_worker = StructuredOutputsWorker(
@@ -495,6 +494,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 device=self.device,
                 mask_stride=self.decode_query_len,
                 num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
+                kernels=self.kernels,
             )
 
         if self.is_pooling_model and self.is_last_pp_rank:
@@ -1356,7 +1356,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
         if num_draft_tokens_per_req is not None:
-            expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+            expanded_idx_mapping, expanded_local_pos = self.kernels.expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
             )
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
@@ -1364,7 +1364,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get prefill tokens if any.
         if batch_req_state.has_prefill:
-            prepare_prefill_inputs(
+            self.kernels.prepare_prefill_inputs(
                 self.input_buffers.input_ids,
                 self.req_states.next_prefill_tokens,
                 idx_mapping,
@@ -1375,7 +1375,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         # Prepare positions and seq_lens.
-        prepare_pos_seq_lens(
+        self.kernels.prepare_pos_seq_lens(
             idx_mapping,
             query_start_loc,
             self.req_states.num_computed_tokens.gpu,
@@ -1386,7 +1386,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Some input token ids are directly read from the last sampled tokens
         # and draft tokens. Also, get the logits indices to sample tokens from.
-        logits_indices = combine_sampled_and_draft_tokens(
+        logits_indices = self.kernels.combine_sampled_and_draft_tokens(
             self.input_buffers.input_ids,
             idx_mapping,
             self.req_states.last_sampled_tokens,
@@ -1604,7 +1604,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_bin_counts = self.sampler.penalties_state.output_bin_counts
         else:
             output_bin_counts = None
-        post_update(
+        self.kernels.post_update(
             idx_mapping,
             self.req_states.num_computed_tokens.gpu,
             self.req_states.last_sampled_tokens,
@@ -1630,12 +1630,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.ec_connector.no_forward(scheduler_output).ec_connector_output,
         )
 
+    def init_kernels(self) -> ModelRunnerKernels:
+        """The kernels the runner, sampler stack and speculator launch. An
+        out-of-tree platform without Triton returns its own implementation."""
+        return TritonKernels()
+
     def init_speculator(self):
         """The drafter for the configured speculative method.
 
         Out-of-tree hardware runners override this to run the draft on their
         own graphs; upstream's `AutoRegressiveSpeculator` drives it eagerly."""
-        return init_speculator(self.vllm_config, self.device)
+        return init_speculator(self.vllm_config, self.device, self.kernels)
 
     def dispatch_batch(
         self,
@@ -2332,7 +2337,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     def postprocess_num_computed_tokens(self, input_batch: InputBatch) -> None:
         # Update the number of computed tokens.
-        post_update_num_computed_tokens(
+        self.kernels.post_update_num_computed_tokens(
             input_batch.idx_mapping,
             self.req_states.num_computed_tokens.gpu,
             input_batch.query_start_loc,

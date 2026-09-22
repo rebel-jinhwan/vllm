@@ -17,10 +17,8 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     xpu_sample,
     xpu_sampler_supported,
 )
-from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
-from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logits_processor.interface import (
     LogitsContext,
@@ -37,6 +35,7 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
 
 class Sampler:
@@ -47,6 +46,7 @@ class Sampler:
         vocab_size: int,
         device: torch.device,
         req_states: RequestState,
+        kernels: ModelRunnerKernels,
         logprobs_mode: LogprobsMode = "raw_logprobs",
         num_speculative_tokens: int = 1,
         use_fp64_gumbel: bool = False,
@@ -59,12 +59,13 @@ class Sampler:
         self.use_fp64_gumbel = use_fp64_gumbel
 
         self.req_states = req_states
-        self.sampling_states = SamplingStates(max_num_reqs, vocab_size)
+        self.kernels = kernels
+        self.sampling_states = SamplingStates(max_num_reqs, vocab_size, kernels)
 
         lp_req_state = LogitsProcRequestState.from_request_state(req_states)
-        self.penalties_state = PenaltiesState(vllm_config, lp_req_state)
-        logit_bias_state = LogitBiasState(vllm_config, lp_req_state)
-        bad_words_state = BadWordsState(vllm_config, lp_req_state)
+        self.penalties_state = PenaltiesState(vllm_config, lp_req_state, kernels)
+        logit_bias_state = LogitBiasState(vllm_config, lp_req_state, kernels)
+        bad_words_state = BadWordsState(vllm_config, lp_req_state, kernels)
 
         # List order is pipeline order: bias adds, penalties scale, so the
         # two do not commute.
@@ -147,7 +148,7 @@ class Sampler:
 
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
-        num_nans = get_num_nans(logits) if self.compute_nans else None
+        num_nans = self.kernels.get_num_nans(logits) if self.compute_nans else None
 
         logprobs_dims = self.get_logprobs_dims(idx_mapping_np)
 
@@ -175,6 +176,7 @@ class Sampler:
             expanded_logits = logits.shape[0] != idx_mapping_np.shape[0]
             cu_num_logits = cu_num_logits_np.tolist() if expanded_logits else None
             logprobs_tensors = compute_topk_scores(
+                self.kernels,
                 logits,
                 num_logprobs,
                 sampled,
@@ -190,7 +192,7 @@ class Sampler:
         # 1 sampled token per request, except chunked-prefill requests
         # (seq_len < prefill_len) which aren't done prefilling and produce no
         # output token. num_rejected is always 0 here (one logit per request).
-        num_sampled, num_rejected = get_num_sampled_and_rejected(
+        num_sampled, num_rejected = self.kernels.get_num_sampled_and_rejected(
             input_batch.seq_lens.new_ones(input_batch.num_reqs),
             input_batch.seq_lens,
             input_batch.cu_num_logits,
@@ -340,7 +342,7 @@ class Sampler:
                 sampled, _ = xpu_sample(processed_logits, top_k, top_p)
         else:
             processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
-            sampled = gumbel_sample(
+            sampled = self.kernels.gumbel_sample(
                 processed_logits,
                 expanded_idx_mapping,
                 self.sampling_states.temperature.gpu,

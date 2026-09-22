@@ -13,18 +13,24 @@ from vllm.model_executor.model_loader import get_model
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.kernels import ModelRunnerKernels
 
 
 class ExtractHiddenStatesSpeculator(DraftModelSpeculator):
     """Cache target hidden states while returning always-accepted draft tokens."""
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        kernels: ModelRunnerKernels,
+    ):
         assert vllm_config.speculative_config is not None
         if vllm_config.speculative_config.draft_sample_method != "greedy":
             raise ValueError(
                 "extract_hidden_states only supports draft_sample_method='greedy'"
             )
-        super().__init__(vllm_config, device)
+        super().__init__(vllm_config, device, kernels)
 
         if self.num_speculative_steps != 1:
             raise ValueError(

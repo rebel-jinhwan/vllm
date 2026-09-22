@@ -12,7 +12,7 @@ from vllm.v1.watermarking import (
     derive_watermark_key,
 )
 from vllm.v1.watermarking.gumbel import _gamma_survival_integer_shape
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.kernels import gumbel_sample
 from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_sample
 
 
